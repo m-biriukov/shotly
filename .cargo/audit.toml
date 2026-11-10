@@ -1,0 +1,8 @@
+# `cargo audit` settings.
+[advisories]
+ignore = [
+    # glib: unsound VariantStrIter. Linux-only (tray-icon -> gtk); not built for macOS.
+    "RUSTSEC-2024-0429",
+    # proc-macro-error: unmaintained. Linux-only build dependency; not built for macOS.
+    "RUSTSEC-2024-0370",
+]
