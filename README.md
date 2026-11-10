@@ -48,13 +48,19 @@ yourself.
    (Apple silicon Macs, macOS 14 or newer).
 2. Unzip it and drag **Screenshoot.app** into `/Applications`.
 3. The app is not signed with an Apple Developer ID, so macOS blocks the first
-   launch with *"Apple could not verify…"*. Open it anyway with either:
-   - **Control-click the app › Open › Open**, or
-   - this command, which removes the download quarantine flag:
+   launch with *"Apple could not verify…"*. Allow it with this command, which
+   removes the download quarantine flag:
 
-     ```sh
-     xattr -dr com.apple.quarantine /Applications/Screenshoot.app
-     ```
+   ```sh
+   /usr/bin/xattr -dr com.apple.quarantine /Applications/Screenshoot.app
+   ```
+
+   (Use the full `/usr/bin/xattr` path: some setups, for example Homebrew
+   tools, put a different `xattr` first on your `PATH`, and it lacks `-r`.)
+
+   Or without the terminal: try to open the app once, then go to **System
+   Settings › Privacy & Security**, scroll to *Security* and click **Open
+   Anyway**. On macOS 14 you can also Control-click the app › **Open**.
 4. Continue with [First launch](#3-first-launch).
 
 You can verify the download with the checksum published on the release page:
