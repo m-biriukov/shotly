@@ -13,7 +13,8 @@ use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_se
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSButton, NSControlStateValueOff, NSControlStateValueOn,
     NSEvent, NSEventMask, NSEventModifierFlags, NSFont, NSModalResponseOK, NSOpenPanel,
-    NSPopUpButton, NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSPopUpButton, NSTabView, NSTabViewItem, NSTextField, NSView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, ns_string,
@@ -21,17 +22,28 @@ use objc2_foundation::{
 use winit::event_loop::EventLoopProxy;
 
 use crate::app::AppEvent;
-use crate::config::{Config, Format, ToastCorner, ToastOffset, ToastSize};
+use crate::config::{
+    Config, FRAME_RATES, Format, HighlightSize, ToastCorner, ToastOffset, ToastSize,
+};
 use crate::login;
 use crate::style::{COLOR_NAMES, Width};
 
 const SIZE_NAMES: [&str; 3] = ["Small", "Medium", "Large"];
 
+/// Which shortcut field is waiting for a key press.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Listening {
+    No,
+    Capture,
+    Record,
+}
+
 struct Ivars {
     proxy: EventLoopProxy<AppEvent>,
     base: Config,
     hotkey: RefCell<String>,
-    recording: Cell<bool>,
+    record_hotkey: RefCell<String>,
+    listening: Cell<Listening>,
     monitor: RefCell<Option<Retained<AnyObject>>>,
     window: OnceCell<Retained<NSWindow>>,
     hotkey_button: OnceCell<Retained<NSButton>>,
@@ -45,17 +57,29 @@ struct Ivars {
     toast_size: OnceCell<Retained<NSPopUpButton>>,
     toast_offset: OnceCell<Retained<NSPopUpButton>>,
     login: OnceCell<Retained<NSButton>>,
+    record_hotkey_button: OnceCell<Retained<NSButton>>,
+    fps: OnceCell<Retained<NSPopUpButton>>,
+    resolution: OnceCell<Retained<NSPopUpButton>>,
+    mic: OnceCell<Retained<NSButton>>,
+    countdown: OnceCell<Retained<NSButton>>,
+    outline: OnceCell<Retained<NSButton>>,
+    highlight_cursor: OnceCell<Retained<NSButton>>,
+    highlight_color: OnceCell<Retained<NSPopUpButton>>,
+    highlight_size: OnceCell<Retained<NSPopUpButton>>,
+    show_clicks: OnceCell<Retained<NSButton>>,
+    left_color: OnceCell<Retained<NSPopUpButton>>,
+    right_color: OnceCell<Retained<NSPopUpButton>>,
 }
 
 define_class!(
     #[unsafe(super = NSObject)]
     #[thread_kind = MainThreadOnly]
     #[ivars = Ivars]
-    struct ScreenshootSettings;
+    struct ShotlySettings;
 
-    unsafe impl NSObjectProtocol for ScreenshootSettings {}
+    unsafe impl NSObjectProtocol for ShotlySettings {}
 
-    unsafe impl NSWindowDelegate for ScreenshootSettings {
+    unsafe impl NSWindowDelegate for ShotlySettings {
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _n: &NSNotification) {
             // The window does not retain its delegate; detach before we go away.
@@ -70,13 +94,15 @@ define_class!(
         }
     }
 
-    impl ScreenshootSettings {
+    impl ShotlySettings {
         #[unsafe(method(recordHotkey:))]
         fn record_hotkey(&self, _sender: Option<&AnyObject>) {
-            self.ivars().recording.set(true);
-            if let Some(b) = self.ivars().hotkey_button.get() {
-                b.setTitle(ns_string!("Type shortcut… (Esc to cancel)"));
-            }
+            self.listen(Listening::Capture);
+        }
+
+        #[unsafe(method(recordRecordHotkey:))]
+        fn record_record_hotkey(&self, _sender: Option<&AnyObject>) {
+            self.listen(Listening::Record);
         }
 
         #[unsafe(method(chooseFolder:))]
@@ -128,7 +154,7 @@ define_class!(
     }
 );
 
-impl ScreenshootSettings {
+impl ShotlySettings {
     fn collect(&self) -> Config {
         let iv = self.ivars();
         let mut cfg = iv.base.clone();
@@ -164,7 +190,39 @@ impl ScreenshootSettings {
             ToastCorner::ALL[pick(&iv.toast_position.get(), ToastCorner::ALL.len())];
         cfg.toast_size = ToastSize::ALL[pick(&iv.toast_size.get(), ToastSize::ALL.len())];
         cfg.toast_offset = ToastOffset::ALL[pick(&iv.toast_offset.get(), ToastOffset::ALL.len())];
+
+        cfg.record_hotkey = iv.record_hotkey.borrow().clone();
+        cfg.record_fps = FRAME_RATES[pick(&iv.fps.get(), FRAME_RATES.len())];
+        let checked =
+            |b: Option<&Retained<NSButton>>| b.is_some_and(|b| b.state() == NSControlStateValueOn);
+        cfg.record_retina = pick(&iv.resolution.get(), 2) == 0;
+        cfg.record_mic = checked(iv.mic.get());
+        cfg.record_countdown = checked(iv.countdown.get());
+        cfg.record_outline = checked(iv.outline.get());
+        cfg.highlight_cursor = checked(iv.highlight_cursor.get());
+        cfg.show_clicks = checked(iv.show_clicks.get());
+        let colors = crate::style::PALETTE.len();
+        cfg.highlight_color = pick(&iv.highlight_color.get(), colors);
+        cfg.left_click_color = pick(&iv.left_color.get(), colors);
+        cfg.right_click_color = pick(&iv.right_color.get(), colors);
+        cfg.highlight_size =
+            HighlightSize::ALL[pick(&iv.highlight_size.get(), HighlightSize::ALL.len())];
         cfg
+    }
+
+    /// Starts waiting for a key press for one of the two shortcut fields.
+    fn listen(&self, which: Listening) {
+        let iv = self.ivars();
+        self.stop_listening();
+        iv.listening.set(which);
+        let button = match which {
+            Listening::Capture => iv.hotkey_button.get(),
+            Listening::Record => iv.record_hotkey_button.get(),
+            Listening::No => None,
+        };
+        if let Some(b) = button {
+            b.setTitle(ns_string!("Type shortcut… (Esc to cancel)"));
+        }
     }
 
     /// Key events while the Settings window is key. Returns true to swallow.
@@ -179,17 +237,22 @@ impl ScreenshootSettings {
         }
         let flags = ev.modifierFlags();
         let code = ev.keyCode();
-        if iv.recording.get() {
+        let listening = iv.listening.get();
+        if listening != Listening::No {
             if code == 53 {
                 // Esc: keep the old shortcut.
-                self.finish_recording();
+                self.stop_listening();
                 return true;
             }
             if let Some(s) = shortcut_string(flags, code)
                 && global_hotkey::hotkey::HotKey::from_str(&s).is_ok()
             {
-                *iv.hotkey.borrow_mut() = s;
-                self.finish_recording();
+                match listening {
+                    Listening::Capture => *iv.hotkey.borrow_mut() = s,
+                    Listening::Record => *iv.record_hotkey.borrow_mut() = s,
+                    Listening::No => {}
+                }
+                self.stop_listening();
             }
             return true;
         }
@@ -214,29 +277,35 @@ impl ScreenshootSettings {
         false
     }
 
-    fn finish_recording(&self) {
-        self.ivars().recording.set(false);
-        if let Some(b) = self.ivars().hotkey_button.get() {
-            b.setTitle(&NSString::from_str(&pretty_shortcut(
-                &self.ivars().hotkey.borrow(),
-            )));
+    /// Stops waiting for a key and shows both shortcuts again.
+    fn stop_listening(&self) {
+        let iv = self.ivars();
+        iv.listening.set(Listening::No);
+        for (button, shortcut) in [
+            (iv.hotkey_button.get(), &iv.hotkey),
+            (iv.record_hotkey_button.get(), &iv.record_hotkey),
+        ] {
+            if let Some(b) = button {
+                b.setTitle(&NSString::from_str(&pretty_shortcut(&shortcut.borrow())));
+            }
         }
     }
 }
 
 /// Owns the Settings window while it is open.
 pub struct Settings {
-    ctrl: Retained<ScreenshootSettings>,
+    ctrl: Retained<ShotlySettings>,
 }
 
 impl Settings {
     pub fn open(cfg: &Config, proxy: EventLoopProxy<AppEvent>) -> Result<Self> {
         let mtm = MainThreadMarker::new().context("Settings must open on the main thread")?;
-        let ctrl = ScreenshootSettings::alloc(mtm).set_ivars(Ivars {
+        let ctrl = ShotlySettings::alloc(mtm).set_ivars(Ivars {
             proxy,
             base: cfg.clone(),
             hotkey: RefCell::new(cfg.hotkey.clone()),
-            recording: Cell::new(false),
+            record_hotkey: RefCell::new(cfg.record_hotkey.clone()),
+            listening: Cell::new(Listening::No),
             monitor: RefCell::new(None),
             window: OnceCell::new(),
             hotkey_button: OnceCell::new(),
@@ -250,9 +319,21 @@ impl Settings {
             toast_size: OnceCell::new(),
             toast_offset: OnceCell::new(),
             login: OnceCell::new(),
+            record_hotkey_button: OnceCell::new(),
+            fps: OnceCell::new(),
+            resolution: OnceCell::new(),
+            mic: OnceCell::new(),
+            countdown: OnceCell::new(),
+            outline: OnceCell::new(),
+            highlight_cursor: OnceCell::new(),
+            highlight_color: OnceCell::new(),
+            highlight_size: OnceCell::new(),
+            show_clicks: OnceCell::new(),
+            left_color: OnceCell::new(),
+            right_color: OnceCell::new(),
         });
         // SAFETY: plain NSObject init of our subclass.
-        let ctrl: Retained<ScreenshootSettings> = unsafe { msg_send![super(ctrl), init] };
+        let ctrl: Retained<ShotlySettings> = unsafe { msg_send![super(ctrl), init] };
         build(&ctrl, cfg, mtm);
 
         let weak = objc2::rc::Weak::from_retained(&ctrl);
@@ -282,6 +363,13 @@ impl Settings {
         }
     }
 
+    /// Closes the window (the app then hears `SettingsClosed`).
+    pub fn close(&self) {
+        if let Some(w) = self.ctrl.ivars().window.get() {
+            w.close();
+        }
+    }
+
     pub fn set_login_checked(&self, on: bool) {
         if let Some(b) = self.ctrl.ivars().login.get() {
             b.setState(if on {
@@ -294,113 +382,243 @@ impl Settings {
 }
 
 const W: f64 = 520.0;
-const H: f64 = 530.0;
+/// Height of one tab's content, and of the tab strip plus margins around it.
+const PAGE_H: f64 = 480.0;
+const TABS_CHROME: f64 = 44.0;
+const BUTTONS_H: f64 = 60.0;
+const H: f64 = PAGE_H + TABS_CHROME + BUTTONS_H;
 const LABEL_W: f64 = 150.0;
-const X: f64 = 24.0 + LABEL_W + 12.0;
+const PAD: f64 = 20.0;
+/// Where controls start inside a tab, right of the labels.
+const X: f64 = PAD + LABEL_W + 12.0;
+const ROW_H: f64 = 34.0;
 
-fn build(ctrl: &Retained<ScreenshootSettings>, cfg: &Config, mtm: MainThreadMarker) {
+/// Lays out a tab's rows top to bottom. A label and its control share one
+/// vertical centre, so their text lines up whatever each one's height is.
+struct Page {
+    view: Retained<NSView>,
+    top: f64,
+    mtm: MainThreadMarker,
+}
+
+impl Page {
+    fn new(mtm: MainThreadMarker) -> Self {
+        let view = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::ZERO, NSSize::new(W - 2.0 * PAD + 20.0, PAGE_H)),
+        );
+        Self {
+            view,
+            top: 14.0,
+            mtm,
+        }
+    }
+
+    /// Vertical centre (Cocoa y, pointing up) of a row `h` tall; moves on.
+    fn next(&mut self, h: f64) -> f64 {
+        let yc = PAGE_H - self.top - h / 2.0;
+        self.top += h;
+        yc
+    }
+
+    /// `label` (may be empty) and its `control`, `w` wide. The text of both
+    /// sits on one baseline. Returns the row's vertical centre.
+    fn row(&mut self, label: &str, control: &NSView, w: f64) -> f64 {
+        let yc = self.next(ROW_H);
+        place(&self.view, control, X, yc, w);
+        if !label.is_empty() {
+            let l = NSTextField::labelWithString(&NSString::from_str(label), self.mtm);
+            l.setAlignment(objc2_app_kit::NSTextAlignment::Right);
+            place(&self.view, &l, PAD, yc, LABEL_W);
+            align_baseline(&l, baseline(control));
+        }
+        yc
+    }
+
+    /// A row with a second control `dx` to the right of the first.
+    fn row_with(
+        &mut self,
+        label: &str,
+        control: &NSView,
+        w: f64,
+        extra: &NSView,
+        dx: f64,
+        ew: f64,
+    ) {
+        let yc = self.row(label, control, w);
+        place(&self.view, extra, X + dx, yc, ew);
+        align_baseline(extra, baseline(control));
+    }
+
+    /// Small grey note under a row.
+    fn hint(&mut self, text: &str) {
+        let yc = self.next(20.0);
+        let hint = NSTextField::labelWithString(&NSString::from_str(text), self.mtm);
+        hint.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+        place(&self.view, &hint, X, yc, 310.0);
+    }
+
+    /// Extra space between groups of rows.
+    fn gap(&mut self, h: f64) {
+        self.top += h;
+    }
+}
+
+fn build(ctrl: &Retained<ShotlySettings>, cfg: &Config, mtm: MainThreadMarker) {
     let iv = ctrl.ivars();
     let target: &AnyObject = ctrl.as_ref();
     let window = new_window(ctrl, mtm);
     let view = window.contentView().expect("content view");
 
-    // Cocoa's y axis points up; rows listed top to bottom.
-    let (y_key, y_dir, y_name, y_fmt, y_color, y_size) = (
-        H - 60.0,
-        H - 96.0,
-        H - 132.0,
-        H - 186.0,
-        H - 222.0,
-        H - 258.0,
-    );
-    let (y_toast, y_pos, y_tsize, y_off, y_login) =
-        (H - 306.0, H - 342.0, H - 378.0, H - 414.0, H - 458.0);
-
-    label(&view, "Capture shortcut:", y_key, mtm);
+    // ---- General ----
+    let mut general = Page::new(mtm);
     let hk = button(
         &pretty_shortcut(&cfg.hotkey),
         target,
         sel!(recordHotkey:),
         mtm,
     );
-    place(&view, &hk, X, y_key, 250.0);
+    general.row("Capture shortcut:", &hk, 250.0);
 
-    label(&view, "Save folder:", y_dir, mtm);
     let folder = NSTextField::textFieldWithString(&NSString::from_str(&cfg.save_dir), mtm);
-    place(&view, &folder, X, y_dir + 2.0, 210.0);
-    place(
-        &view,
-        &button("Choose…", target, sel!(chooseFolder:), mtm),
-        X + 216.0,
-        y_dir,
-        96.0,
-    );
+    let choose = button("Choose…", target, sel!(chooseFolder:), mtm);
+    general.row_with("Save folder:", &folder, 210.0, &choose, 216.0, 96.0);
 
-    label(&view, "File name:", y_name, mtm);
     let filename = NSTextField::textFieldWithString(&NSString::from_str(&cfg.filename), mtm);
-    place(&view, &filename, X, y_name + 2.0, 310.0);
-    let hint = NSTextField::labelWithString(ns_string!("{date} and {time} are filled in"), mtm);
-    hint.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-    place(&view, &hint, X, y_name - 20.0, 310.0);
+    general.row("File name:", &filename, 310.0);
+    general.hint("{date} and {time} are filled in");
 
-    label(&view, "Format:", y_fmt, mtm);
     let format = popup(
         &["PNG", "JPEG (quality 90)"],
         usize::from(cfg.format == Format::Jpeg),
         mtm,
     );
-    place(&view, &format, X, y_fmt, 200.0);
+    general.row("Format:", &format, 200.0);
 
-    label(&view, "Default color:", y_color, mtm);
     let color = popup(&COLOR_NAMES, cfg.color, mtm);
-    place(&view, &color, X, y_color, 200.0);
+    general.row("Default color:", &color, 200.0);
 
-    label(&view, "Default size:", y_size, mtm);
     let size_idx = Width::ALL
         .iter()
         .position(|&w| w == cfg.width())
         .unwrap_or(1);
     let size = popup(&SIZE_NAMES, size_idx, mtm);
-    place(&view, &size, X, y_size, 200.0);
+    general.row("Default size:", &size, 200.0);
 
+    general.gap(10.0);
+    let login_box = checkbox("Launch at login", login::is_enabled(), mtm);
+    general.row("", &login_box, 310.0);
+
+    // ---- Notice ----
+    let mut notice = Page::new(mtm);
     let toast = checkbox("Show notice after copy or save", cfg.toast, mtm);
-    place(&view, &toast, X, y_toast, 310.0);
+    notice.row("", &toast, 310.0);
 
-    label(&view, "Notice position:", y_pos, mtm);
     let names = ToastCorner::ALL.map(ToastCorner::name);
     let toast_position = popup(
         &names,
         index_of(&ToastCorner::ALL, &cfg.toast_position),
         mtm,
     );
-    place(&view, &toast_position, X, y_pos, 200.0);
+    notice.row("Position:", &toast_position, 200.0);
 
-    label(&view, "Notice size:", y_tsize, mtm);
     let names = ToastSize::ALL.map(ToastSize::name);
     let toast_size = popup(&names, index_of(&ToastSize::ALL, &cfg.toast_size), mtm);
-    place(&view, &toast_size, X, y_tsize, 200.0);
+    notice.row("Size:", &toast_size, 200.0);
 
-    label(&view, "Distance from edge:", y_off, mtm);
     let names = ToastOffset::ALL.map(ToastOffset::name);
     let toast_offset = popup(&names, index_of(&ToastOffset::ALL, &cfg.toast_offset), mtm);
-    place(&view, &toast_offset, X, y_off, 200.0);
-    place(
-        &view,
-        &button("Preview", target, sel!(previewToast:), mtm),
-        X + 210.0,
-        y_off,
+    let preview = button("Preview", target, sel!(previewToast:), mtm);
+    notice.row_with(
+        "Distance from edge:",
+        &toast_offset,
+        200.0,
+        &preview,
+        210.0,
         100.0,
     );
 
-    let login_box = checkbox("Launch at login", login::is_enabled(), mtm);
-    place(&view, &login_box, X, y_login, 310.0);
+    // ---- Recording ----
+    let mut rec = Page::new(mtm);
+    let rec_hk = button(
+        &pretty_shortcut(&cfg.record_hotkey),
+        target,
+        sel!(recordRecordHotkey:),
+        mtm,
+    );
+    rec.row("Record shortcut:", &rec_hk, 250.0);
+    rec.hint("Press it again to stop recording");
+
+    let fps_names = FRAME_RATES.map(|f| format!("{f} fps"));
+    let fps_names: Vec<&str> = fps_names.iter().map(String::as_str).collect();
+    let fps = popup(&fps_names, index_of(&FRAME_RATES, &cfg.record_fps), mtm);
+    rec.row("Frame rate:", &fps, 200.0);
+
+    let resolution = popup(
+        &["Retina (full pixels)", "Standard (points)"],
+        usize::from(!cfg.record_retina),
+        mtm,
+    );
+    rec.row("Resolution:", &resolution, 200.0);
+
+    let mic = checkbox("Record microphone", cfg.record_mic, mtm);
+    rec.row("", &mic, 310.0);
+    let countdown = checkbox(
+        "Count down 3-2-1 before starting",
+        cfg.record_countdown,
+        mtm,
+    );
+    rec.row("", &countdown, 310.0);
+    let outline = checkbox("Show a frame around the area", cfg.record_outline, mtm);
+    rec.row("", &outline, 310.0);
+
+    rec.gap(10.0);
+    let highlight_cursor = checkbox("Highlight the mouse pointer", cfg.highlight_cursor, mtm);
+    rec.row("", &highlight_cursor, 310.0);
+    let highlight_color = popup(&COLOR_NAMES, cfg.highlight_color, mtm);
+    rec.row("Highlight color:", &highlight_color, 200.0);
+    let names = HighlightSize::ALL.map(HighlightSize::name);
+    let highlight_size = popup(
+        &names,
+        index_of(&HighlightSize::ALL, &cfg.highlight_size),
+        mtm,
+    );
+    rec.row("Highlight size:", &highlight_size, 200.0);
+
+    rec.gap(10.0);
+    let show_clicks = checkbox("Show mouse clicks", cfg.show_clicks, mtm);
+    rec.row("", &show_clicks, 310.0);
+    let left_color = popup(&COLOR_NAMES, cfg.left_click_color, mtm);
+    rec.row("Left click color:", &left_color, 200.0);
+    let right_color = popup(&COLOR_NAMES, cfg.right_click_color, mtm);
+    rec.row("Right click color:", &right_color, 200.0);
+
+    // ---- Tabs and buttons ----
+    let tabs = NSTabView::initWithFrame(
+        NSTabView::alloc(mtm),
+        NSRect::new(
+            NSPoint::new(PAD - 10.0, BUTTONS_H),
+            NSSize::new(W - 2.0 * (PAD - 10.0), PAGE_H + TABS_CHROME),
+        ),
+    );
+    for (title, page) in [
+        ("General", &general),
+        ("Notice", &notice),
+        ("Recording", &rec),
+    ] {
+        let item = NSTabViewItem::new();
+        item.setLabel(&NSString::from_str(title));
+        item.setView(Some(&page.view));
+        tabs.addTabViewItem(&item);
+    }
+    view.addSubview(&tabs);
 
     let save = button("Save", target, sel!(save:), mtm);
     let cancel = button("Cancel", target, sel!(cancel:), mtm);
     save.setKeyEquivalent(ns_string!("\r"));
     cancel.setKeyEquivalent(ns_string!("\u{1b}"));
-    place(&view, &save, W - 24.0 - 96.0, 20.0, 96.0);
-    place(&view, &cancel, W - 24.0 - 96.0 - 8.0 - 96.0, 20.0, 96.0);
+    place(&view, &save, W - 24.0 - 96.0, 30.0, 96.0);
+    place(&view, &cancel, W - 24.0 - 96.0 - 8.0 - 96.0, 30.0, 96.0);
 
     let _ = iv.hotkey_button.set(hk);
     let _ = iv.folder.set(folder);
@@ -413,12 +631,24 @@ fn build(ctrl: &Retained<ScreenshootSettings>, cfg: &Config, mtm: MainThreadMark
     let _ = iv.toast_size.set(toast_size);
     let _ = iv.toast_offset.set(toast_offset);
     let _ = iv.login.set(login_box);
+    let _ = iv.record_hotkey_button.set(rec_hk);
+    let _ = iv.fps.set(fps);
+    let _ = iv.resolution.set(resolution);
+    let _ = iv.mic.set(mic);
+    let _ = iv.countdown.set(countdown);
+    let _ = iv.outline.set(outline);
+    let _ = iv.highlight_cursor.set(highlight_cursor);
+    let _ = iv.highlight_color.set(highlight_color);
+    let _ = iv.highlight_size.set(highlight_size);
+    let _ = iv.show_clicks.set(show_clicks);
+    let _ = iv.left_color.set(left_color);
+    let _ = iv.right_color.set(right_color);
     window.center();
     let _ = iv.window.set(window);
 }
 
 /// The titled, closable Settings window, delegating to `ctrl`.
-fn new_window(ctrl: &Retained<ScreenshootSettings>, mtm: MainThreadMarker) -> Retained<NSWindow> {
+fn new_window(ctrl: &Retained<ShotlySettings>, mtm: MainThreadMarker) -> Retained<NSWindow> {
     // SAFETY: standard window creation; released-when-closed is turned off
     // because we hold a Retained reference.
     let window = unsafe {
@@ -432,7 +662,7 @@ fn new_window(ctrl: &Retained<ScreenshootSettings>, mtm: MainThreadMarker) -> Re
         w.setReleasedWhenClosed(false);
         w
     };
-    window.setTitle(ns_string!("Screenshoot Settings"));
+    window.setTitle(ns_string!("Shotly Settings"));
     window.setDelegate(Some(ProtocolObject::from_ref(&**ctrl)));
     window
 }
@@ -474,12 +704,6 @@ fn index_of<T: PartialEq>(all: &[T], value: &T) -> usize {
     all.iter().position(|v| v == value).unwrap_or(0)
 }
 
-fn label(view: &NSView, text: &str, y: f64, mtm: MainThreadMarker) {
-    let l = NSTextField::labelWithString(&NSString::from_str(text), mtm);
-    l.setAlignment(objc2_app_kit::NSTextAlignment::Right);
-    place(view, &l, 24.0, y + 4.0, LABEL_W);
-}
-
 fn popup(items: &[&str], selected: usize, mtm: MainThreadMarker) -> Retained<NSPopUpButton> {
     let p = NSPopUpButton::initWithFrame_pullsDown(NSPopUpButton::alloc(mtm), NSRect::ZERO, false);
     for item in items {
@@ -489,10 +713,27 @@ fn popup(items: &[&str], selected: usize, mtm: MainThreadMarker) -> Retained<NSP
     p
 }
 
-/// Adds `v` to `view` at (`x`, `y`) with width `w` and its natural height.
-fn place(view: &NSView, v: &NSView, x: f64, y: f64, w: f64) {
-    let h = v.fittingSize().height.max(22.0);
-    v.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)));
+/// Where the first line of text in `v` sits, as a y in its superview.
+fn baseline(v: &NSView) -> f64 {
+    let f = v.frame();
+    f.origin.y + f.size.height - v.firstBaselineOffsetFromTop()
+}
+
+/// Moves `v` up or down so its first line of text sits at `baseline`.
+fn align_baseline(v: &NSView, baseline: f64) {
+    let mut f = v.frame();
+    f.origin.y = (baseline - (f.size.height - v.firstBaselineOffsetFromTop())).round();
+    v.setFrame(f);
+}
+
+/// Adds `v` to `view` with its left edge at `x`, `w` wide, its natural
+/// height, and its vertical centre at `y_center`.
+fn place(view: &NSView, v: &NSView, x: f64, y_center: f64, w: f64) {
+    let h = v.fittingSize().height.max(20.0);
+    v.setFrame(NSRect::new(
+        NSPoint::new(x, (y_center - h / 2.0).round()),
+        NSSize::new(w, h),
+    ));
     view.addSubview(v);
 }
 

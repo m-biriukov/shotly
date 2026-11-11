@@ -9,7 +9,7 @@ use crate::geom::Point;
 use crate::render::Backdrop;
 use crate::style::Tool;
 
-/// `SCREENSHOOT_PROFILE=1`: times the heaviest interactions. It draws into
+/// `SHOTLY_PROFILE=1`: times the heaviest interactions. It draws into
 /// the live capture, so it only exists in `--features dev-hooks` builds.
 pub(super) fn run(session: &mut Session) {
     let Some(w) = session.wins.first_mut() else {

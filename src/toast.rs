@@ -214,7 +214,7 @@ impl Toast {
             style.offset.pt(),
         );
         let attrs = Window::default_attributes()
-            .with_title("screenshoot")
+            .with_title("shotly")
             .with_decorations(false)
             .with_resizable(false)
             .with_active(false)

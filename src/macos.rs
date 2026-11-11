@@ -3,9 +3,9 @@
 use objc2::rc::Retained;
 use objc2::{MainThreadMarker, msg_send};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationOptions, NSColor, NSRunningApplication, NSScreen,
-    NSScreenSaverWindowLevel, NSStatusWindowLevel, NSView, NSWindow, NSWindowCollectionBehavior,
-    NSWorkspace,
+    NSApplication, NSApplicationActivationOptions, NSColor, NSEvent, NSRunningApplication,
+    NSScreen, NSScreenSaverWindowLevel, NSStatusWindowLevel, NSView, NSWindow,
+    NSWindowCollectionBehavior, NSWorkspace,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
@@ -57,6 +57,71 @@ pub fn style_toast(window: &Window, corner_radius: f64) {
     }
 }
 
+/// A transparent, click-through window above everything, on every Space:
+/// the base of the pointer halo, click ripples and the recording frame.
+/// With `fill` (0xRRGGBB) the window is a solid bar of that colour.
+pub fn style_effect(window: &Window, fill: Option<u32>) {
+    let Some(w) = ns_window(window) else { return };
+    w.setLevel(NSScreenSaverWindowLevel);
+    w.setCollectionBehavior(all_spaces());
+    w.setOpaque(false);
+    w.setHasShadow(false);
+    w.setIgnoresMouseEvents(true);
+    let bg = match fill {
+        Some(rgb) => {
+            let c = |shift: u32| f64::from((rgb >> shift) & 0xFF) / 255.0;
+            NSColor::colorWithSRGBRed_green_blue_alpha(c(16), c(8), c(0), 1.0)
+        }
+        None => NSColor::clearColor(),
+    };
+    w.setBackgroundColor(Some(&bg));
+}
+
+thread_local! {
+    /// sRGB, made once: ripples redraw every frame.
+    static SRGB: std::cell::OnceCell<Option<objc2_core_foundation::CFRetained<objc2_core_graphics::CGColorSpace>>> =
+        const { std::cell::OnceCell::new() };
+}
+
+/// Shows `pm` (premultiplied RGBA, `scale` pixels per point) as the whole
+/// content of a window made with [`style_effect`].
+pub fn set_window_image(window: &Window, pm: &tiny_skia::Pixmap, scale: f64) {
+    let Some(w) = ns_window(window) else {
+        return eprintln!("overlay window has no NSWindow");
+    };
+    let Some(view) = w.contentView() else {
+        return eprintln!("overlay window has no content view");
+    };
+    let Some(space) = SRGB.with(|c| {
+        c.get_or_init(objc2_core_graphics::CGColorSpace::new_device_rgb)
+            .clone()
+    }) else {
+        return eprintln!("could not create a colour space");
+    };
+    view.setWantsLayer(true);
+    let img = crate::layers::image(pm, &space);
+    // SAFETY: plain property read of a layer-backed view.
+    let layer: Option<Retained<objc2_quartz_core::CALayer>> = unsafe { msg_send![&*view, layer] };
+    if let Some(layer) = layer {
+        layer.setContentsScale(scale);
+        crate::layers::set_contents(&layer, Some(&img));
+    }
+}
+
+/// Where the mouse pointer is, in global points (top-left origin).
+pub fn mouse_location() -> Option<(f64, f64)> {
+    let mtm = MainThreadMarker::new()?;
+    let primary_h = NSScreen::screens(mtm).firstObject()?.frame().size.height;
+    let p = NSEvent::mouseLocation();
+    Some((p.x, primary_h - p.y))
+}
+
+/// Mouse buttons held down right now: bit 0 left, bit 1 right, others after.
+/// Needs no permission, unlike watching key presses.
+pub fn pressed_mouse_buttons() -> usize {
+    NSEvent::pressedMouseButtons()
+}
+
 /// Sets a window's opacity (0 = invisible, 1 = opaque).
 pub fn set_window_alpha(window: &Window, alpha: f64) {
     if let Some(w) = ns_window(window) {
@@ -71,6 +136,17 @@ pub fn reduce_motion() -> bool {
 
 /// A display frame in global points: x, y (top-left origin), width, height.
 pub type Frame = (i32, i32, u32, u32);
+
+/// Where display `id` sits, in global points (top-left origin).
+pub fn display_frame(id: objc2_core_graphics::CGDirectDisplayID) -> Frame {
+    let b = objc2_core_graphics::CGDisplayBounds(id);
+    (
+        b.origin.x.round() as i32,
+        b.origin.y.round() as i32,
+        b.size.width.round() as u32,
+        b.size.height.round() as u32,
+    )
+}
 
 /// Converts a Cocoa rectangle (origin bottom-left of the primary display)
 /// into global points with a top-left origin, as `CGDisplayBounds` uses.

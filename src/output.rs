@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn save_never_overwrites() {
-        let dir = std::env::temp_dir().join(format!("screenshoot-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shotly-test-{}", std::process::id()));
         let img = RgbaImage::new(4, 4);
         let a = save(&img, &dir, "shot.png", Format::Png).unwrap();
         let b = save(&img, &dir, "shot.png", Format::Png).unwrap();

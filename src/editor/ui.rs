@@ -55,6 +55,8 @@ pub struct Snapping {
     pub hover: Option<Rect>,
     /// `hover` at the press that started creating the area.
     pub on_press: Option<Rect>,
+    /// Where that press was, to tell a click from a drag.
+    pub press_at: Option<Point>,
 }
 
 impl Snapping {

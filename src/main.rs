@@ -1,13 +1,14 @@
-//! Screenshoot: a macOS menu-bar screenshot tool with annotations.
+//! Shotly: a macOS menu-bar screenshot and screen-recording tool with annotations.
 //!
-//! `screenshoot`            run in the menu bar (global hotkey, Settings…)
-//! `screenshoot --capture`  take one screenshot right away, then exit
+//! `shotly`            run in the menu bar (global hotkey, Settings…)
+//! `shotly --capture`  take one screenshot right away, then exit
 
 mod app;
 mod capture;
 mod config;
 mod editor;
 mod geom;
+mod highlight;
 mod keys;
 mod layers;
 mod login;
@@ -15,6 +16,7 @@ mod macos;
 mod output;
 mod overlay;
 mod paint;
+mod record;
 mod render;
 mod settings;
 mod shape;
@@ -24,6 +26,7 @@ mod text;
 mod theme;
 mod toast;
 mod toolbar;
+mod tray;
 
 use anyhow::Result;
 use winit::event_loop::EventLoop;
@@ -32,6 +35,7 @@ use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 fn main() -> Result<()> {
     let oneshot = std::env::args().skip(1).any(|a| a == "--capture");
     log_to_file_unless_terminal();
+    migrate_from_screenshoot(oneshot);
     // Two menu-bar copies would fight over the shortcut; keep the first one.
     let _lock = if oneshot {
         None
@@ -40,7 +44,7 @@ fn main() -> Result<()> {
             Lock::Held(f) => Some(f),
             Lock::Unavailable => None,
             Lock::TakenByOther => {
-                println!("Screenshoot is already running in the menu bar.");
+                println!("Shotly is already running in the menu bar.");
                 return Ok(());
             }
         }
@@ -54,6 +58,15 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Carries over what the app kept under its old name, Screenshoot: the
+/// settings, and "Launch at login" (the menu-bar app only).
+fn migrate_from_screenshoot(oneshot: bool) {
+    config::Config::migrate_legacy();
+    if !oneshot {
+        login::migrate_legacy();
+    }
+}
+
 enum Lock {
     Held(std::fs::File),
     TakenByOther,
@@ -65,7 +78,7 @@ enum Lock {
 /// when the process exits (even if it crashes).
 fn single_instance_lock() -> Lock {
     use std::os::fd::AsRawFd;
-    let path = config::Config::path().with_file_name("screenshoot.lock");
+    let path = config::Config::path().with_file_name("shotly.lock");
     let file = path
         .parent()
         .and_then(|d| std::fs::create_dir_all(d).ok())
@@ -89,7 +102,7 @@ fn single_instance_lock() -> Lock {
 }
 
 /// Apps started from Finder or at login have nowhere to print, so errors and
-/// crashes would vanish. Send stdout/stderr to `~/Library/Logs/Screenshoot.log`
+/// crashes would vanish. Send stdout/stderr to `~/Library/Logs/Shotly.log`
 /// instead (owner-only; rotated past 1 MB). Terminal runs keep printing.
 fn log_to_file_unless_terminal() {
     use std::io::Write;
@@ -103,9 +116,9 @@ fn log_to_file_unless_terminal() {
     let Some(dir) = dirs::home_dir().map(|h| h.join("Library/Logs")) else {
         return;
     };
-    let path = dir.join("Screenshoot.log");
+    let path = dir.join("Shotly.log");
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > 1_000_000) {
-        let _ = std::fs::rename(&path, dir.join("Screenshoot.old.log"));
+        let _ = std::fs::rename(&path, dir.join("Shotly.old.log"));
     }
     let _ = std::fs::create_dir_all(&dir);
     let Ok(mut file) = std::fs::OpenOptions::new()
@@ -118,7 +131,7 @@ fn log_to_file_unless_terminal() {
     };
     let _ = writeln!(
         file,
-        "--- {} Screenshoot {} started ---",
+        "--- {} Shotly {} started ---",
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
         env!("CARGO_PKG_VERSION")
     );

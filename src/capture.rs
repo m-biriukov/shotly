@@ -1,6 +1,6 @@
 //! Grabs a frozen image of every display before the overlay appears.
 //!
-//! Capture goes through `ScreenCaptureKit` (`SCScreenshotManager`, macOS 14+).
+//! Capture goes through `ScreenCaptureKit` (`SCScreenshotManager`).
 //! Its API is asynchronous; each call is bridged to a plain blocking call
 //! with a channel, and the displays are captured concurrently. The list of
 //! displays and our own running-application entry (`SCShareableContent`) is
@@ -30,15 +30,16 @@ use objc2_core_graphics::{
 use objc2_foundation::{NSArray, NSError};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCRunningApplication, SCScreenshotManager, SCShareableContent,
-    SCStreamConfiguration,
+    SCStreamConfiguration, SCWindow,
 };
 
 /// `ScreenCaptureKit` never calls back if something goes wrong in the daemon;
 /// better an error than a frozen menu-bar app.
-const SCK_TIMEOUT: Duration = Duration::from_secs(5);
+pub const SCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One display's frozen contents plus where it sits in global coordinates.
 pub struct Shot {
+    pub display_id: CGDirectDisplayID,
     /// Top-left corner in global points (CG coordinates: origin at the
     /// primary display's top-left, y grows downwards).
     pub origin_pt: (i32, i32),
@@ -119,7 +120,7 @@ impl<T: CrossThread> SendBox<T> {
 
 static CONTENT: Mutex<Option<Content>> = Mutex::new(None);
 
-fn error_text(err: *mut NSError) -> String {
+pub fn error_text(err: *mut NSError) -> String {
     // SAFETY: the handler passes either null or a valid NSError.
     match unsafe { err.as_ref() } {
         Some(e) => e.localizedDescription().to_string(),
@@ -127,7 +128,8 @@ fn error_text(err: *mut NSError) -> String {
     }
 }
 
-fn fetch_content() -> Result<Content> {
+/// Asks `ScreenCaptureKit` for the current screens, windows and apps.
+fn fetch_shareable() -> Result<Retained<SCShareableContent>> {
     let (tx, rx) = mpsc::channel();
     let handler = RcBlock::new(move |content: *mut SCShareableContent, err: *mut NSError| {
         // SAFETY: `content` is null or valid for the call; retaining keeps it.
@@ -138,11 +140,15 @@ fn fetch_content() -> Result<Content> {
     });
     // SAFETY: the block matches the handler signature and is kept alive by the callee.
     unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
-    let content = rx
+    Ok(rx
         .recv_timeout(SCK_TIMEOUT)
         .map_err(|_| anyhow::anyhow!("ScreenCaptureKit did not answer"))?
         .map_err(|e| anyhow::anyhow!("listing screens: {e}"))?
-        .0;
+        .0)
+}
+
+fn fetch_content() -> Result<Content> {
+    let content = fetch_shareable()?;
     let pid = std::process::id() as i32;
     // SAFETY: plain property reads on live objects.
     let (displays, ours) = unsafe {
@@ -155,6 +161,26 @@ fn fetch_content() -> Result<Content> {
         (displays, ours)
     };
     Ok(Content { displays, ours })
+}
+
+/// Our own windows that are on screen now, except those titled `keep_title`
+/// (the pointer halo and click ripples, which a recording must show). Used to
+/// keep Settings, a notice or similar out of a video.
+pub fn own_windows_except(keep_title: &str) -> Result<Retained<NSArray<SCWindow>>> {
+    let content = fetch_shareable()?;
+    let pid = std::process::id() as i32;
+    // SAFETY: plain property reads on live objects.
+    let own: Vec<Retained<SCWindow>> = unsafe {
+        content
+            .windows()
+            .iter()
+            .filter(|w| {
+                w.owningApplication().is_some_and(|a| a.processID() == pid)
+                    && w.title().is_none_or(|t| t.to_string() != keep_title)
+            })
+            .collect()
+    };
+    Ok(NSArray::from_retained_slice(&own))
 }
 
 /// Cached content, refreshed when a display we need is not in it (plugged
@@ -174,8 +200,23 @@ fn with_content<R>(ids: &[CGDirectDisplayID], f: impl FnOnce(&Content) -> Result
     f(guard.as_ref().expect("content was just filled"))
 }
 
+/// Runs `f` with `ScreenCaptureKit`'s entry for display `id`.
+pub fn with_display<R>(
+    id: CGDirectDisplayID,
+    f: impl FnOnce(&SCDisplay) -> Result<R>,
+) -> Result<R> {
+    with_content(&[id], |c| {
+        let display = c
+            .displays
+            .iter()
+            .find(|(d, _)| *d == id)
+            .context("display not found")?;
+        f(&display.1)
+    })
+}
+
 /// Native pixel size of a display (`CGDisplayBounds` is in points).
-fn pixel_size(id: CGDirectDisplayID, fallback_pt: (usize, usize)) -> (usize, usize) {
+pub fn pixel_size(id: CGDirectDisplayID, fallback_pt: (usize, usize)) -> (usize, usize) {
     match CGDisplayCopyDisplayMode(id) {
         Some(mode) => (
             CGDisplayMode::pixel_width(Some(&mode)),
@@ -270,6 +311,7 @@ pub struct Capture {
 }
 
 struct InFlight {
+    display_id: CGDirectDisplayID,
     origin_pt: (i32, i32),
     size_pt: (u32, u32),
     pending: Pending,
@@ -293,6 +335,7 @@ impl Capture {
                 let cg = finish_capture(&d.pending)?;
                 let converting = start_conversion(&cg);
                 Ok(Shot {
+                    display_id: d.display_id,
                     origin_pt: d.origin_pt,
                     size_pt: d.size_pt,
                     cg,
@@ -322,10 +365,11 @@ pub fn begin() -> Result<Capture> {
         .into_iter()
         .zip(pending)
         .map(|(id, pending)| {
-            let b = CGDisplayBounds(id);
+            let (x, y, w, h) = crate::macos::display_frame(id);
             InFlight {
-                origin_pt: (b.origin.x.round() as i32, b.origin.y.round() as i32),
-                size_pt: (b.size.width.round() as u32, b.size.height.round() as u32),
+                display_id: id,
+                origin_pt: (x, y),
+                size_pt: (w, h),
                 pending,
             }
         })

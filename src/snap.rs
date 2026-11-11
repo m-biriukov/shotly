@@ -14,6 +14,8 @@ use crate::geom::{Rect, Scale};
 /// A window frame in global points (origin at the primary display's top-left).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Frame {
+    /// `CGWindowID`; `None` when the frame is not a window.
+    pub id: Option<u32>,
     pub x: f64,
     pub y: f64,
     pub w: f64,
@@ -55,18 +57,53 @@ pub fn list_windows() -> Vec<Frame> {
         if number(dict, "kCGWindowAlpha").is_some_and(|a| a == 0) {
             continue;
         }
-        let Some(r) = bounds(dict) else { continue };
-        if r.size.width < MIN_SIDE_PT || r.size.height < MIN_SIDE_PT {
+        let Some(frame) = frame_of_dict(dict) else {
+            continue;
+        };
+        if frame.w < MIN_SIDE_PT || frame.h < MIN_SIDE_PT {
             continue;
         }
-        out.push(Frame {
-            x: r.origin.x,
-            y: r.origin.y,
-            w: r.size.width,
-            h: r.size.height,
-        });
+        out.push(frame);
     }
     out
+}
+
+/// A window's number and bounds from one entry of `CGWindowListCopyWindowInfo`.
+fn frame_of_dict(dict: &CFDictionary) -> Option<Frame> {
+    let r = bounds(dict)?;
+    Some(Frame {
+        id: number(dict, "kCGWindowNumber")
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|&n| n != 0),
+        x: r.origin.x,
+        y: r.origin.y,
+        w: r.size.width,
+        h: r.size.height,
+    })
+}
+
+/// Where window `id` is now, or `None` if it is gone.
+pub fn frame_of(id: u32) -> Option<Frame> {
+    let list = CGWindowListCopyWindowInfo(CGWindowListOption::OptionIncludingWindow, id)?;
+    let list: &CFArray = &list;
+    for i in 0..list.count() {
+        // SAFETY: `i` is below `list.count()`.
+        let item = unsafe { list.value_at_index(i) };
+        if item.is_null() {
+            continue;
+        }
+        // SAFETY: array elements are CF objects kept alive by `list`; the
+        // runtime type is checked before use.
+        let Some(dict) = (unsafe { &*(item as *const CFType) }).downcast_ref::<CFDictionary>()
+        else {
+            continue;
+        };
+        if number(dict, "kCGWindowNumber") != Some(id as i32) {
+            continue;
+        }
+        return frame_of_dict(dict);
+    }
+    None
 }
 
 fn value<'a>(dict: &'a CFDictionary, key: &str) -> Option<&'a CFType> {
@@ -132,18 +169,21 @@ mod tests {
     fn converts_and_clips_to_display() {
         let frames = [
             Frame {
+                id: Some(1),
                 x: 100.0,
                 y: 50.0,
                 w: 200.0,
                 h: 100.0,
             },
             Frame {
+                id: Some(2),
                 x: -500.0,
                 y: 0.0,
                 w: 400.0,
                 h: 300.0,
             },
             Frame {
+                id: Some(3),
                 x: 1400.0,
                 y: 900.0,
                 w: 400.0,
@@ -162,6 +202,19 @@ mod tests {
         // Second display to the left at x = -1000 pt, 1x.
         let r = to_display(&frames, (-1000, 0), Scale(1.0), Rect::new(0, 0, 1000, 800));
         assert_eq!(r, vec![Rect::new(500, 0, 400, 300)]);
+    }
+
+    #[test]
+    #[ignore = "needs windows on screen"]
+    fn a_listed_window_is_found_again_by_its_id() {
+        let listed = list_windows();
+        let Some(first) = listed.iter().find(|f| f.id.is_some()) else {
+            return;
+        };
+        let again = frame_of(first.id.unwrap()).expect("window is still there");
+        assert_eq!(again.id, first.id);
+        assert!((again.w - first.w).abs() < 1.0 && (again.h - first.h).abs() < 1.0);
+        assert_eq!(frame_of(u32::MAX), None);
     }
 
     #[test]
