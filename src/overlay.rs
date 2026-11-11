@@ -14,15 +14,25 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::capture::{self, Shot};
-use crate::config::Config;
+use crate::config::{Config, Preset};
 use crate::editor::{Action, Cursor, EditKey, Editor};
 use crate::geom::{Handle, Point, Rect, Scale};
 use crate::keys::latin_shortcut;
 use crate::layers::Layers;
+use crate::record::Target;
 use crate::render::Backdrop;
 use crate::style::{Tool, Width};
 use crate::toolbar::Item;
 use crate::{macos, output, snap};
+
+/// What the capture session is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Pick an area, annotate it, copy or save an image.
+    Screenshot,
+    /// Pick an area to record as video.
+    Record,
+}
 
 #[cfg(feature = "dev-hooks")]
 mod profile;
@@ -78,6 +88,8 @@ pub enum Outcome {
     Cancelled,
     Copied,
     Saved(PathBuf),
+    /// The user picked an area to record (record mode).
+    Record(Target),
     Failed(String),
 }
 
@@ -86,8 +98,10 @@ pub struct Finished {
     /// Last colour/size used, to remember for next time.
     pub color: usize,
     pub width: Width,
+    /// Preset in use when the session ended, to remember for next time.
+    pub preset: Preset,
     /// Frame (global points) of the display the capture was on.
-    pub display: (i32, i32, u32, u32),
+    pub display: macos::Frame,
 }
 
 /// Max gap and distance (points) between clicks of a double-click.
@@ -95,6 +109,9 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const DOUBLE_CLICK_PT: f64 = 4.0;
 
 pub struct Session {
+    mode: Mode,
+    /// Window frames on screen when the session started (global points).
+    frames: Vec<snap::Frame>,
     cfg: Config,
     shots: Vec<Shot>,
     wins: Vec<Win>,
@@ -104,7 +121,7 @@ pub struct Session {
 
 impl Session {
     /// Freezes every display and covers it with an overlay window.
-    pub fn start(el: &ActiveEventLoop, cfg: &Config) -> Result<Self> {
+    pub fn start(el: &ActiveEventLoop, cfg: &Config, mode: Mode) -> Result<Self> {
         // Order matters: list and capture before any of our windows are visible.
         // The window list and the capture are independent; overlap them. The
         // capture takes ~60 ms in ScreenCaptureKit, so the (hidden) overlay
@@ -115,7 +132,7 @@ impl Session {
         let mut windows = Vec::new();
         for (origin, size) in capture.frames() {
             let attrs = Window::default_attributes()
-                .with_title("screenshoot")
+                .with_title("shotly")
                 .with_decorations(false)
                 .with_resizable(false)
                 .with_visible(false)
@@ -140,6 +157,10 @@ impl Session {
             let mut editor = Editor::new(bounds, scale);
             editor.set_defaults(cfg.color, cfg.width());
             editor.set_snaps(snap::to_display(&frames, shot.origin_pt, scale, bounds));
+            if mode == Mode::Record {
+                editor.set_record_mode();
+            }
+            editor.set_preset(cfg.preset);
             wins.push(Win {
                 window,
                 layers,
@@ -152,12 +173,19 @@ impl Session {
             });
         }
         let mut session = Self {
+            mode,
+            frames,
             cfg: cfg.clone(),
             shots,
             wins,
             modifiers: ModifiersState::empty(),
             last_click: None,
         };
+        // Full screen: the display under the pointer is selected right away.
+        if cfg.preset == Preset::Full {
+            let i = session.display_under_pointer().unwrap_or(0);
+            session.choose_preset(i, Preset::Full);
+        }
         // Layers are filled before the windows appear, so there is no flash.
         session.flush();
         macos::activate_app();
@@ -169,7 +197,7 @@ impl Session {
             w.window.focus_window();
         }
         #[cfg(feature = "dev-hooks")]
-        if std::env::var_os("SCREENSHOOT_PROFILE").is_some() {
+        if std::env::var_os("SHOTLY_PROFILE").is_some() {
             eprintln!(
                 "profile: capture {:?} (windows created during it: {:?}), layers {:?}, total {:?}",
                 t2 - t0,
@@ -182,6 +210,36 @@ impl Session {
         #[cfg(not(feature = "dev-hooks"))]
         let _ = (t0, t1, t2);
         Ok(session)
+    }
+
+    /// Index of the window whose display holds the mouse pointer.
+    fn display_under_pointer(&self) -> Option<usize> {
+        let (mx, my) = macos::mouse_location()?;
+        self.wins.iter().position(|w| {
+            let shot = &self.shots[w.shot];
+            let (x, y) = (f64::from(shot.origin_pt.0), f64::from(shot.origin_pt.1));
+            let (sw, sh) = (f64::from(shot.size_pt.0), f64::from(shot.size_pt.1));
+            mx >= x && mx < x + sw && my >= y && my < y + sh
+        })
+    }
+
+    /// Switches display `i` to `preset` (a key press).
+    fn choose_preset(&mut self, i: usize, preset: Preset) {
+        self.choose_preset_others(i, preset);
+        self.wins[i].editor.choose_preset(preset);
+        self.wins[i].dirty = true;
+    }
+
+    /// Keeps the other displays in step with display `i`: same preset, and
+    /// only one display holds the selected area.
+    fn choose_preset_others(&mut self, i: usize, preset: Preset) {
+        for (j, w) in self.wins.iter_mut().enumerate() {
+            if j != i {
+                w.editor.set_preset(preset);
+                w.editor.clear_area();
+                w.dirty = true;
+            }
+        }
     }
 
     pub fn owns(&self, id: WindowId) -> bool {
@@ -260,6 +318,7 @@ impl Session {
             outcome,
             color: ed.color(),
             width: ed.width(),
+            preset: ed.preset(),
             display: (
                 shot.origin_pt.0,
                 shot.origin_pt.1,
@@ -274,6 +333,11 @@ impl Session {
             return Some(self.finished(i, Outcome::Cancelled));
         }
         let i = self.active()?;
+        if action == Action::Record {
+            // Return before any area was picked does nothing.
+            self.wins[i].editor.area()?;
+            return Some(self.start_recording(i));
+        }
         self.wins[i].editor.finish_edit();
         let win = &self.wins[i];
         let (w, h) = win.size();
@@ -304,7 +368,66 @@ impl Session {
         Some(self.finished(i, outcome))
     }
 
+    /// The picked area as a recording target. If it is exactly a window
+    /// (the user clicked one), the recording follows that window.
+    fn start_recording(&mut self, i: usize) -> Finished {
+        let win = &self.wins[i];
+        let shot = &self.shots[win.shot];
+        let area = win.editor.area().unwrap_or(Rect::new(0, 0, 1, 1));
+        let s = win.window.scale_factor();
+        let picked = snap::Frame {
+            id: None,
+            x: f64::from(shot.origin_pt.0) + f64::from(area.x) / s,
+            y: f64::from(shot.origin_pt.1) + f64::from(area.y) / s,
+            w: f64::from(area.w) / s,
+            h: f64::from(area.h) / s,
+        };
+        let window = window_at(&self.frames, &picked);
+        let target = Target {
+            display_id: shot.display_id,
+            area: picked,
+            window,
+        };
+        for w in &self.wins {
+            w.window.set_visible(false);
+        }
+        self.finished(i, Outcome::Record(target))
+    }
+
+    /// The F / W / C preset keys. Returns true if the key was used.
+    fn preset_key(&mut self, i: usize, event: &KeyEvent) -> bool {
+        if self.modifiers.super_key() || self.modifiers.control_key() {
+            return false;
+        }
+        let Some(p) =
+            latin_shortcut(&event.logical_key, event.physical_key).and_then(Preset::from_key)
+        else {
+            return false;
+        };
+        // Letters are drawing tools too (not F, W or C), but never while typing text.
+        if self
+            .active()
+            .is_some_and(|a| self.wins[a].editor.is_editing())
+        {
+            return false;
+        }
+        self.choose_preset(i, p);
+        self.update_cursor(i);
+        true
+    }
+
     fn key(&mut self, i: usize, event: &KeyEvent) -> Option<Finished> {
+        if self.preset_key(i, event) {
+            return None;
+        }
+        if self.mode == Mode::Record {
+            // Only Return (start) and Esc (cancel); no drawing tools here.
+            return match event.logical_key.as_ref() {
+                Key::Named(NamedKey::Escape) => self.act(i, Action::Cancel),
+                Key::Named(NamedKey::Enter) => self.act(i, Action::Record),
+                _ => None,
+            };
+        }
         let cmd = self.modifiers.super_key();
         let shift = self.modifiers.shift_key();
         let key = event.logical_key.as_ref();
@@ -429,8 +552,14 @@ impl Session {
                         self.wins[i].tip.shown = false;
                         self.wins[i].tip.suppressed = true;
                         let double = self.is_double_click(i, p);
+                        let before = self.wins[i].editor.preset();
                         if let Some(action) = self.wins[i].editor.press(p, double) {
                             return self.act(i, action);
+                        }
+                        // A strip click on this display applies on the others too.
+                        let after = self.wins[i].editor.preset();
+                        if after != before {
+                            self.choose_preset_others(i, after);
                         }
                     }
                     ElementState::Released => self.wins[i].editor.release(p, shift),
@@ -447,6 +576,68 @@ impl Session {
     }
 }
 
+/// The window whose frame is `picked` (within a point), if any.
+fn window_at(frames: &[snap::Frame], picked: &snap::Frame) -> Option<u32> {
+    const TOLERANCE_PT: f64 = 1.5;
+    frames
+        .iter()
+        .find(|f| {
+            (f.x - picked.x).abs() <= TOLERANCE_PT
+                && (f.y - picked.y).abs() <= TOLERANCE_PT
+                && (f.w - picked.w).abs() <= TOLERANCE_PT
+                && (f.h - picked.h).abs() <= TOLERANCE_PT
+        })
+        .and_then(|f| f.id)
+}
+
 fn to_point(p: PhysicalPosition<f64>) -> Point {
     Point::new(p.x.round() as i32, p.y.round() as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(id: u32, x: f64, y: f64, w: f64, h: f64) -> snap::Frame {
+        snap::Frame {
+            id: Some(id),
+            x,
+            y,
+            w,
+            h,
+        }
+    }
+
+    fn frame_none(x: f64, y: f64, w: f64, h: f64) -> snap::Frame {
+        snap::Frame {
+            id: None,
+            x,
+            y,
+            w,
+            h,
+        }
+    }
+
+    #[test]
+    fn an_area_that_is_exactly_a_window_follows_it() {
+        let frames = [
+            frame(7, 100.0, 50.0, 800.0, 600.0),
+            frame(9, 0.0, 0.0, 300.0, 200.0),
+        ];
+        let exact = frame_none(100.4, 49.6, 800.0, 600.9);
+        assert_eq!(window_at(&frames, &exact), Some(7));
+        // Dragged by hand, or resized: a plain area.
+        assert_eq!(
+            window_at(&frames, &frame_none(110.0, 50.0, 800.0, 600.0)),
+            None
+        );
+        // A frame without an id is not followable.
+        assert_eq!(
+            window_at(
+                &[frame_none(1.0, 1.0, 5.0, 5.0)],
+                &frame_none(1.0, 1.0, 5.0, 5.0)
+            ),
+            None
+        );
+    }
 }

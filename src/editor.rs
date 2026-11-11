@@ -3,6 +3,7 @@
 //! undo/redo. Pure state machine, no windowing, so it can be unit tested.
 
 mod history;
+mod presets;
 mod text_edit;
 mod ui;
 
@@ -11,6 +12,7 @@ pub use text_edit::EditKey;
 use text_edit::TextEdit;
 use ui::{Snapping, ToolbarUi};
 
+use crate::config::Preset;
 use crate::geom::{Handle, Hit, Point, Rect, Scale, Selection};
 use crate::shape::{Kind, Shape, ShapeHandle, Style};
 use crate::style::{PALETTE, Tool, Width};
@@ -21,6 +23,8 @@ use crate::toolbar::{self, Item, Toolbar};
 pub enum Action {
     Copy,
     Save,
+    /// Start recording the selected area (record mode).
+    Record,
     Cancel,
 }
 
@@ -92,6 +96,10 @@ pub struct Editor {
     history: History<Vec<Shape>>,
     ui: ToolbarUi,
     snap: Snapping,
+    /// Picking an area to record: no drawing, a Record button instead of Copy/Save.
+    record: bool,
+    /// How the area is picked: whole display, a window, or by hand.
+    preset: Preset,
 }
 
 impl Editor {
@@ -116,7 +124,16 @@ impl Editor {
             history: History::default(),
             ui: ToolbarUi::default(),
             snap: Snapping::default(),
+            record: false,
+            preset: Preset::Custom,
         }
+    }
+
+    /// Switches to picking an area to record: the select tool only, and a
+    /// toolbar with just Record and Close.
+    pub fn set_record_mode(&mut self) {
+        self.record = true;
+        self.choices.tool = Tool::Select;
     }
 
     /// Starting colour and size (no shape is touched).
@@ -140,7 +157,7 @@ impl Editor {
 
     /// Highlighted window frame shown before any area is chosen.
     pub fn preview(&self) -> Option<Rect> {
-        if self.area().is_none() && self.drag.is_none() {
+        if self.area().is_none() && self.drag.is_none() && self.preset == Preset::Window {
             self.snap.hover
         } else {
             None
@@ -231,7 +248,7 @@ impl Editor {
             return None;
         }
         self.area()
-            .map(|a| toolbar::layout(a, self.bounds, self.scale))
+            .map(|a| toolbar::layout(a, self.bounds, self.scale, self.record))
     }
 
     /// The open group's flyout, if any.
@@ -248,6 +265,16 @@ impl Editor {
     /// The hovered toolbar/flyout button with the bars around it, for tooltips.
     pub fn hover_target(&self) -> Option<HoverTarget> {
         let item = self.ui.hover?;
+        if let Some(strip) = self.strip()
+            && let Some(&(_, rect)) = strip.items.iter().find(|(i, _)| *i == item)
+        {
+            return Some(HoverTarget {
+                item,
+                rect,
+                bar: strip.rect,
+                other: None,
+            });
+        }
         let tb = self.toolbar()?;
         let fly = self.flyout();
         if let Some(f) = &fly
@@ -287,6 +314,7 @@ impl Editor {
             color: self.choices.color,
             width: self.choices.width,
             text_bg: self.choices.text_bg,
+            preset: self.preset,
             shape_tool: self.ui.shape_tool,
             draw_tool: self.ui.draw_tool,
             open: self.ui.open,
@@ -424,6 +452,8 @@ impl Editor {
             Item::Redo => self.redo(),
             Item::Copy => return Some(Action::Copy),
             Item::Save => return Some(Action::Save),
+            Item::Record => return Some(Action::Record),
+            Item::Preset(p) => self.choose_preset(p),
             Item::Close => return Some(Action::Cancel),
         }
         None
@@ -523,6 +553,7 @@ impl Editor {
 
     /// `double` is set for the second press of a double-click.
     pub fn press(&mut self, p: Point, double: bool) -> Option<Action> {
+        self.snap.on_press = None;
         if let Some(handled) = self.press_bars(p) {
             self.drag = Some(Drag::Ignore);
             return handled;
@@ -534,6 +565,9 @@ impl Editor {
     /// Presses on the toolbar or a flyout, or that close an open flyout.
     /// `Some(action)` when the press was used up here.
     fn press_bars(&mut self, p: Point) -> Option<Option<Action>> {
+        if let Some(strip) = self.strip().filter(|b| b.rect.contains(p)) {
+            return Some(strip.hit(p).and_then(|item| self.click_item(item)));
+        }
         let on_toolbar = self.toolbar().filter(|tb| tb.rect.contains(p));
         if let Some(f) = self.flyout() {
             if f.rect.contains(p) {
@@ -563,8 +597,27 @@ impl Editor {
             return;
         }
         if self.area().is_none() {
+            match self.preset {
+                // Only a click picks a window; a drag does nothing.
+                Preset::Window => {
+                    self.snap.on_press = self.snap.at(p);
+                    self.snap.press_at = Some(p);
+                    self.drag = Some(Drag::Ignore);
+                }
+                Preset::Full => {
+                    self.choose_preset(Preset::Full);
+                    self.drag = Some(Drag::Ignore);
+                }
+                Preset::Custom => self.press_area(p),
+            }
+            return;
+        }
+        // Window: a click outside the window picks another one.
+        if self.preset == Preset::Window && matches!(self.area.hit(p), Hit::Outside) {
             self.snap.on_press = self.snap.at(p);
-            return self.press_area(p);
+            self.snap.press_at = Some(p);
+            self.drag = Some(Drag::Ignore);
+            return;
         }
         if let Some((idx, handle)) = self.selected_handle_at(p) {
             let orig = self.shapes[idx].clone();
@@ -622,11 +675,14 @@ impl Editor {
     pub fn motion(&mut self, p: Point, shift: bool) -> bool {
         match &self.drag {
             None | Some(Drag::Ignore) => {
-                let hover = self
-                    .flyout()
-                    .and_then(|f| f.hit(p))
-                    .or_else(|| self.toolbar().and_then(|tb| tb.hit(p)));
-                let snap = if self.area().is_none() {
+                let hover = [self.strip(), self.flyout(), self.toolbar()]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|bar| bar.hit(p));
+                let snap = if self.area().is_none()
+                    && self.preset == Preset::Window
+                    && self.bar_at(p).is_none()
+                {
                     self.snap.at(p)
                 } else {
                     None
@@ -665,7 +721,21 @@ impl Editor {
     pub fn release(&mut self, p: Point, shift: bool) {
         self.motion(p, shift);
         match self.drag.take() {
-            None | Some(Drag::Ignore) => {}
+            Some(Drag::Ignore) => {
+                // A click on a window (Window preset) picks it.
+                let click_slop = self.scale.px(GRAB_PT / 2.0);
+                let press = self.snap.press_at.take();
+                let clicked = press.is_some_and(|q| {
+                    (p.x - q.x).abs() <= click_slop && (p.y - q.y).abs() <= click_slop
+                });
+                let window = self.snap.on_press.take();
+                if self.preset == Preset::Window
+                    && clicked
+                    && let Some(r) = window
+                {
+                    self.area.set_rect(r);
+                }
+            }
             Some(Drag::Area) => {
                 self.area.release(p);
                 // A click (no drag) before any area exists picks the window under it.
@@ -688,13 +758,15 @@ impl Editor {
                     self.selected = Some(self.shapes.len() - 1);
                 }
             }
-            Some(Drag::Move { idx, orig, .. } | Drag::Handle { idx, orig, .. }) => {
-                if self.shapes[idx] != orig {
-                    let mut before = self.shapes.clone();
-                    before[idx] = orig;
-                    self.history.record(before);
-                }
+            Some(Drag::Move { idx, orig, .. } | Drag::Handle { idx, orig, .. })
+                if self.shapes[idx] != orig =>
+            {
+                let mut before = self.shapes.clone();
+                before[idx] = orig;
+                self.history.record(before);
             }
+            // Nothing was dragged, or nothing moved.
+            None | Some(Drag::Move { .. } | Drag::Handle { .. }) => {}
         }
     }
 
@@ -715,9 +787,7 @@ impl Editor {
             Some(Drag::Area) => return area_cursor(self.area.hit(p)),
             Some(Drag::Ignore) | None => {}
         }
-        if self.toolbar().is_some_and(|tb| tb.rect.contains(p))
-            || self.flyout().is_some_and(|f| f.rect.contains(p))
-        {
+        if self.bar_at(p).is_some() {
             return Cursor::Pointer;
         }
         if let Some(e) = &self.edit {
@@ -966,24 +1036,66 @@ mod tests {
     }
 
     #[test]
-    fn click_selects_window_under_cursor_and_drag_ignores_it() {
+    fn window_preset_picks_a_window_by_click_and_ignores_drags() {
         let mut e = Editor::new(Rect::new(0, 0, 2000, 1500), 1.0);
         e.set_snaps(vec![
             Rect::new(100, 100, 300, 200),
             Rect::new(50, 50, 1000, 1000),
         ]);
+        e.choose_preset(Preset::Window);
         e.motion(Point::new(150, 150), false);
         assert_eq!(e.preview(), Some(Rect::new(100, 100, 300, 200)));
         e.motion(Point::new(600, 600), false);
         assert_eq!(e.preview(), Some(Rect::new(50, 50, 1000, 1000)));
+        // A drag is not a selection.
+        drag(&mut e, (150, 150), (200, 220));
+        assert_eq!(e.area(), None);
         click(&mut e, (150, 150), false);
         assert_eq!(e.area(), Some(Rect::new(100, 100, 300, 200)));
         assert_eq!(e.preview(), None);
+        // A click outside it picks another window.
+        click(&mut e, (600, 600), false);
+        assert_eq!(e.area(), Some(Rect::new(50, 50, 1000, 1000)));
+    }
 
+    #[test]
+    fn custom_preset_ignores_windows_and_drags_an_area() {
         let mut e = Editor::new(Rect::new(0, 0, 2000, 1500), 1.0);
         e.set_snaps(vec![Rect::new(100, 100, 300, 200)]);
+        e.motion(Point::new(150, 150), false);
+        assert_eq!(e.preview(), None);
         drag(&mut e, (150, 150), (200, 220));
         assert_eq!(e.area(), Some(Rect::new(150, 150, 50, 70)));
+    }
+
+    #[test]
+    fn full_screen_preset_selects_the_whole_display() {
+        let mut e = Editor::new(Rect::new(0, 0, 2000, 1500), 1.0);
+        e.choose_preset(Preset::Full);
+        assert_eq!(e.area(), Some(Rect::new(0, 0, 2000, 1500)));
+        assert!(e.toolbar().is_some());
+        // Back to Window: the selection is dropped, ready for a click.
+        e.choose_preset(Preset::Window);
+        assert_eq!(e.area(), None);
+    }
+
+    #[test]
+    fn strip_buttons_switch_presets() {
+        let mut e = Editor::new(Rect::new(0, 0, 2000, 1500), 1.0);
+        let strip = e.strip().unwrap();
+        let centre = |bar: &Toolbar, item| {
+            let r = bar.items.iter().find(|(i, _)| *i == item).unwrap().1;
+            (r.x + r.w / 2, r.y + r.h / 2)
+        };
+        let full = centre(&strip, Item::Preset(Preset::Full));
+        click(&mut e, full, false);
+        assert_eq!(e.preset(), Preset::Full);
+        assert_eq!(e.area(), Some(Rect::new(0, 0, 2000, 1500)));
+        let custom = centre(&e.strip().unwrap(), Item::Preset(Preset::Custom));
+        click(&mut e, custom, false);
+        assert_eq!(e.preset(), Preset::Custom);
+        // The area stays; a new drag outside it now starts a new one by hand.
+        assert_eq!(e.area(), Some(Rect::new(0, 0, 2000, 1500)));
     }
 
     #[test]

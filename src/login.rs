@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-const LABEL: &str = "dev.screenshoot.agent";
+const LABEL: &str = "dev.shotly.agent";
 
 fn plist_path() -> Option<PathBuf> {
     Some(
@@ -13,6 +13,39 @@ fn plist_path() -> Option<PathBuf> {
             .join("Library/LaunchAgents")
             .join(format!("{LABEL}.plist")),
     )
+}
+
+/// Label of the launch agent from when the app was called Screenshoot.
+const LEGACY_LABEL: &str = "dev.screenshoot.agent";
+
+/// If "Launch at login" was on under the old name, its agent points at the
+/// old app and no longer works: replace it with one for this app.
+pub fn migrate_legacy() {
+    let Some(dir) = dirs::home_dir().map(|h| h.join("Library/LaunchAgents")) else {
+        return;
+    };
+    if !remove_legacy_agent(&dir) {
+        return;
+    }
+    match set_enabled(true) {
+        Ok(()) => println!("Moved Launch at Login from Screenshoot to Shotly"),
+        Err(e) => eprintln!("launch at login (after rename): {e:#}"),
+    }
+}
+
+/// Deletes the old agent's plist from `dir`. True if there was one.
+fn remove_legacy_agent(dir: &std::path::Path) -> bool {
+    let old = dir.join(format!("{LEGACY_LABEL}.plist"));
+    if !old.exists() {
+        return false;
+    }
+    match std::fs::remove_file(&old) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("could not remove {}: {e}", old.display());
+            false
+        }
+    }
 }
 
 pub fn is_enabled() -> bool {
@@ -67,9 +100,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_old_agent_is_removed_once() {
+        let dir = std::env::temp_dir().join(format!("shotly-agents-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!remove_legacy_agent(&dir), "nothing to remove yet");
+        std::fs::write(dir.join(format!("{LEGACY_LABEL}.plist")), "x").unwrap();
+        assert!(remove_legacy_agent(&dir));
+        assert!(!remove_legacy_agent(&dir), "gone after the first time");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn plist_escapes_path() {
-        let p = plist("/Apps/A&B <x>/screenshoot");
-        assert!(p.contains("<string>/Apps/A&amp;B &lt;x&gt;/screenshoot</string>"));
+        let p = plist("/Apps/A&B <x>/shotly");
+        assert!(p.contains("<string>/Apps/A&amp;B &lt;x&gt;/shotly</string>"));
         assert!(p.contains(LABEL));
     }
 }

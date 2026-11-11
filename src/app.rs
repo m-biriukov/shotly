@@ -1,7 +1,6 @@
 //! The long-running menu-bar app: tray icon and menu, global hotkey,
 //! capture sessions, toasts and the Settings window.
 
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use global_hotkey::hotkey::HotKey;
@@ -9,21 +8,31 @@ use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use objc2::rc::Retained;
 use objc2_app_kit::NSRunningApplication;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::WindowId;
 
 use crate::config::{self, Config};
-use crate::overlay::{Finished, Outcome, Session};
+use crate::overlay::{Finished, Mode, Outcome, Session};
 use crate::settings::Settings;
 use crate::toast::{Notice, OnClick, Step, Toast, ToastStyle};
+use crate::tray::tray_icon_image;
 use crate::{login, macos};
+
+mod flow;
+mod hotkeys;
+mod recording;
+
+use flow::{Cmd, Flow, Input};
+use hotkeys::config_accelerator;
+use recording::{Active, Counting, Finishing};
 
 #[derive(Debug)]
 pub enum AppEvent {
-    HotKey,
+    /// A global shortcut was pressed (the `HotKey::id`).
+    HotKey(u32),
     Menu(MenuId),
     /// The Settings window saved a new config (already written to disk).
     ConfigChanged(Config),
@@ -31,6 +40,8 @@ pub enum AppEvent {
     /// The Settings window's "Preview" button: show a sample notice with
     /// these (not yet saved) settings.
     PreviewToast(Config),
+    /// The recording ended (stopped, or failed on its own); see `Recording::poll`.
+    RecordingDone,
 }
 
 /// Lets the tray menu close before the screen is frozen.
@@ -40,6 +51,7 @@ const TOAST_LONG: Duration = Duration::from_millis(2500);
 
 struct MenuItems {
     capture: MenuItem,
+    record: MenuItem,
     settings: MenuItem,
     login: CheckMenuItem,
     quit: MenuItem,
@@ -53,12 +65,21 @@ pub struct App {
     cfg: Config,
     hotkeys: Option<GlobalHotKeyManager>,
     hotkey: Option<HotKey>,
+    record_hotkey: Option<HotKey>,
     tray: Option<TrayIcon>,
     menu: Option<MenuItems>,
     session: Option<Session>,
     /// App that was frontmost before the capture, to hand focus back to.
     prev_app: Option<Retained<NSRunningApplication>>,
-    pending_capture: Option<Instant>,
+    pending_capture: Option<(Instant, Mode)>,
+    /// What the app is doing (see `flow`); `session`, `counting` and
+    /// `recording` hold the matching data.
+    flow: Flow,
+    counting: Option<Counting>,
+    recording: Option<Active>,
+    /// Recordings that failed on their own; kept (and stopped) until they
+    /// report, so no stream or delegate is freed while still in use.
+    finishing: Vec<Finishing>,
     toast: Option<Toast>,
     settings: Option<Settings>,
 }
@@ -72,11 +93,16 @@ impl App {
             cfg: Config::load(),
             hotkeys: None,
             hotkey: None,
+            record_hotkey: None,
             tray: None,
             menu: None,
             session: None,
             prev_app: None,
             pending_capture: None,
+            flow: Flow::new(),
+            counting: None,
+            recording: None,
+            finishing: Vec::new(),
             toast: None,
             settings: None,
         }
@@ -84,12 +110,18 @@ impl App {
 
     fn setup_menu_bar(&mut self) -> anyhow::Result<()> {
         let capture = MenuItem::new("Capture Area", true, config_accelerator(&self.cfg.hotkey));
+        let record = MenuItem::new(
+            "Record Screen",
+            true,
+            config_accelerator(&self.cfg.record_hotkey),
+        );
         let settings = MenuItem::new("Settings…", true, None);
         let login = CheckMenuItem::new("Launch at Login", true, login::is_enabled(), None);
-        let quit = MenuItem::new("Quit Screenshoot", true, None);
+        let quit = MenuItem::new("Quit Shotly", true, None);
         let menu = Menu::new();
         menu.append_items(&[
             &capture,
+            &record,
             &PredefinedMenuItem::separator(),
             &settings,
             &login,
@@ -99,11 +131,12 @@ impl App {
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_icon_templated(tray_icon_image())
-            .with_tooltip("Screenshoot")
+            .with_tooltip("Shotly")
             .build()?;
         self.tray = Some(tray);
         self.menu = Some(MenuItems {
             capture,
+            record,
             settings,
             login,
             quit,
@@ -116,77 +149,63 @@ impl App {
         let proxy = self.proxy.clone();
         GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
             if e.state == HotKeyState::Pressed {
-                let _ = proxy.send_event(AppEvent::HotKey);
+                let _ = proxy.send_event(AppEvent::HotKey(e.id));
             }
         }));
         self.hotkeys = Some(GlobalHotKeyManager::new()?);
         Ok(())
     }
 
-    /// (Re-)registers the configured shortcut. On failure (invalid, or
-    /// reserved by another app) tells the user how to fix it.
-    fn register_hotkey(&mut self, el: &ActiveEventLoop) {
-        let Some(mgr) = &self.hotkeys else { return };
-        let pretty = crate::settings::pretty_shortcut(&self.cfg.hotkey);
-        let new = match HotKey::from_str(&self.cfg.hotkey) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("invalid hotkey {:?}: {e}", self.cfg.hotkey);
-                return self.hotkey_problem(el, format!("Shortcut {pretty} is not valid"));
+    /// The capture shortcut (or a menu item, after its delay).
+    fn start_capture(&mut self, el: &ActiveEventLoop, mode: Mode) {
+        let cmds = self
+            .flow
+            .step(Input::CaptureRequested(mode), self.cfg.record_countdown);
+        self.run_picker_cmds(el, &cmds);
+    }
+
+    /// Carries out the commands that open a picker or refuse a screenshot.
+    fn run_picker_cmds(&mut self, el: &ActiveEventLoop, cmds: &[Cmd]) {
+        for cmd in cmds {
+            match *cmd {
+                Cmd::OpenPicker(mode) => self.open_picker(el, mode),
+                Cmd::ShowBusyNotice => {
+                    // The freeze-frame overlay would end up in the video.
+                    let notice = Notice::new("Recording in progress", TOAST_SHORT)
+                        .detail("Stop it first to take a screenshot")
+                        .important();
+                    self.notify(el, None, notice);
+                }
+                _ => {}
             }
-        };
-        if self.hotkey == Some(new) {
-            return;
-        }
-        if let Some(old) = self.hotkey.take() {
-            let _ = mgr.unregister(old);
-        }
-        let ok = match mgr.register(new) {
-            Ok(()) => {
-                self.hotkey = Some(new);
-                true
-            }
-            Err(e) => {
-                eprintln!("could not register hotkey {:?}: {e}", self.cfg.hotkey);
-                false
-            }
-        };
-        if let Some(m) = &self.menu {
-            let accel = if ok {
-                config_accelerator(&self.cfg.hotkey)
-            } else {
-                None
-            };
-            let _ = m.capture.set_accelerator(accel);
-        }
-        if !ok {
-            self.hotkey_problem(el, format!("Shortcut {pretty} is used by another app"));
         }
     }
 
-    fn hotkey_problem(&mut self, el: &ActiveEventLoop, title: String) {
-        // Important: without it the app looks dead.
-        let detail = "Choose another one in Settings… (menu bar icon)";
-        self.notify(
-            el,
-            None,
-            Notice::new(title, Duration::from_secs(6))
-                .detail(detail)
-                .important(),
-        );
-    }
-
-    fn start_capture(&mut self, el: &ActiveEventLoop) {
-        if self.session.is_some() {
-            return;
-        }
+    fn open_picker(&mut self, el: &ActiveEventLoop, mode: Mode) {
         // The toast would end up in the screenshot.
         self.toast = None;
         self.prev_app = macos::frontmost_other_app();
-        match Session::start(el, &self.cfg) {
+        match Session::start(el, &self.cfg, mode) {
             Ok(s) => self.session = Some(s),
-            Err(e) if e.is::<crate::capture::NoPermission>() => self.permission_problem(el),
+            Err(e) if e.is::<crate::capture::NoPermission>() => {
+                self.flow.step(Input::PickerClosed { picked: false }, false);
+                self.permission_problem(el);
+            }
             Err(e) => self.finish(el, None, Some(format!("{e:#}"))),
+        }
+    }
+
+    /// The data the app holds agrees with what the flow says is going on
+    /// (checked in debug builds, between events).
+    fn flow_matches_data(&self) -> bool {
+        use flow::Phase::{Counting, Idle, Picking, Recording, Starting, Stopping};
+        match self.flow.phase() {
+            Idle => self.session.is_none() && self.counting.is_none() && self.recording.is_none(),
+            Picking(_) => self.session.is_some(),
+            Counting => self.counting.is_some(),
+            Recording | Stopping => self.recording.is_some(),
+            // Only while the stream starts, inside one event handler.
+            Starting => false,
         }
     }
 
@@ -194,11 +213,11 @@ impl App {
         let who = if std::env::var_os("TERM").is_some() {
             "the app you started it from (your terminal)"
         } else {
-            "Screenshoot"
+            "Shotly"
         };
         eprintln!(
             "Screen Recording permission is missing. Enable {who} in System Settings › Privacy & Security › \
-             Screen Recording, then restart Screenshoot."
+             Screen Recording, then restart Shotly."
         );
         if self.oneshot {
             return el.exit();
@@ -212,6 +231,10 @@ impl App {
 
     fn finish(&mut self, el: &ActiveEventLoop, done: Option<Finished>, error: Option<String>) {
         self.session = None;
+        let picked = matches!(done.as_ref().map(|d| &d.outcome), Some(Outcome::Record(_)));
+        let cmds = self
+            .flow
+            .step(Input::PickerClosed { picked }, self.cfg.record_countdown);
         if self.oneshot {
             if let Some(Outcome::Saved(p)) = done.as_ref().map(|d| &d.outcome) {
                 println!("Saved {}", p.display());
@@ -240,29 +263,19 @@ impl App {
             );
             return;
         };
-        // Remember the last colour/size for next time.
-        if done.color != self.cfg.color || config::parse_width(&self.cfg.width) != Some(done.width)
-        {
-            self.cfg.color = done.color;
-            self.cfg.set_width(done.width);
-            if let Err(e) = self.cfg.save() {
-                eprintln!("could not save config: {e:#}");
-            }
+        self.remember_choices(&done);
+        if let Outcome::Record(target) = &done.outcome {
+            let target = *target;
+            return self.begin_recording(el, target, &cmds);
         }
         let display = Some(done.display);
         match done.outcome {
-            Outcome::Cancelled => {}
+            Outcome::Cancelled | Outcome::Record(_) => {}
             Outcome::Copied => {
                 self.notify(el, display, Notice::new("Copied to clipboard", TOAST_SHORT));
             }
             Outcome::Saved(p) => {
-                let name = p
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let notice = Notice::new("Saved — click to show in Finder", TOAST_LONG)
-                    .detail(name)
-                    .on_click(OnClick::Reveal(p));
+                let notice = saved_notice("Saved — click to show in Finder", p);
                 self.notify(el, display, notice);
             }
             Outcome::Failed(e) => {
@@ -276,9 +289,22 @@ impl App {
         }
     }
 
+    /// Remembers the last colour, size and preset for next time.
+    fn remember_choices(&mut self, done: &Finished) {
+        if !choices_changed(&self.cfg, done) {
+            return;
+        }
+        self.cfg.color = done.color;
+        self.cfg.set_width(done.width);
+        self.cfg.preset = done.preset;
+        if let Err(e) = self.cfg.save() {
+            eprintln!("could not save config: {e:#}");
+        }
+    }
+
     /// Shows `n` on `display` (or the main display). Skipped when notices
     /// are turned off in Settings, unless it is important.
-    fn notify(&mut self, el: &ActiveEventLoop, display: Option<(i32, i32, u32, u32)>, n: Notice) {
+    fn notify(&mut self, el: &ActiveEventLoop, display: Option<macos::Frame>, n: Notice) {
         if !self.cfg.toast && !n.important {
             return;
         }
@@ -289,7 +315,7 @@ impl App {
     fn show_notice(
         &mut self,
         el: &ActiveEventLoop,
-        display: Option<(i32, i32, u32, u32)>,
+        display: Option<macos::Frame>,
         style: ToastStyle,
         n: Notice,
     ) {
@@ -307,6 +333,8 @@ impl App {
         }
     }
 
+    // ---- recording ----
+
     fn open_settings(&mut self) {
         if let Some(s) = &self.settings {
             s.show();
@@ -320,7 +348,7 @@ impl App {
 
     fn apply_config(&mut self, el: &ActiveEventLoop, cfg: Config) {
         self.cfg = cfg;
-        self.register_hotkey(el);
+        self.register_hotkeys(el);
         if let Some(m) = &self.menu {
             m.login.set_checked(login::is_enabled());
         }
@@ -329,7 +357,13 @@ impl App {
     fn menu_event(&mut self, el: &ActiveEventLoop, id: &MenuId) {
         let Some(m) = &self.menu else { return };
         if id == m.capture.id() {
-            self.pending_capture = Some(Instant::now() + MENU_CAPTURE_DELAY);
+            self.pending_capture = Some((Instant::now() + MENU_CAPTURE_DELAY, Mode::Screenshot));
+        } else if id == m.record.id() {
+            if self.flow.running() {
+                self.toggle_recording(el);
+            } else {
+                self.pending_capture = Some((Instant::now() + MENU_CAPTURE_DELAY, Mode::Record));
+            }
         } else if id == m.settings.id() {
             self.open_settings();
         } else if id == m.login.id() {
@@ -342,7 +376,7 @@ impl App {
                 s.set_login_checked(login::is_enabled());
             }
         } else if id == m.quit.id() {
-            el.exit();
+            self.quit(el);
         }
     }
 }
@@ -354,43 +388,53 @@ impl ApplicationHandler<AppEvent> for App {
         }
         self.started = true;
         if self.oneshot {
-            self.start_capture(el);
+            self.start_capture(el, Mode::Screenshot);
         } else if let Err(e) = self.setup_menu_bar() {
             eprintln!("error: could not set up menu bar: {e:#}");
             el.exit();
         } else {
             println!(
-                "Screenshoot is running in the menu bar. Shortcut: {}",
+                "Shotly is running in the menu bar. Shortcut: {}",
                 self.cfg.hotkey
             );
             crate::capture::warm_up();
-            self.register_hotkey(el);
-            // Dev aid (only with `--features dev-hooks`): SCREENSHOOT_TEST_SETTINGS=1
+            self.register_hotkeys(el);
+            // Dev aid (only with `--features dev-hooks`): SHOTLY_TEST_SETTINGS=1
             // opens the Settings window right away.
-            if cfg!(feature = "dev-hooks")
-                && std::env::var_os("SCREENSHOOT_TEST_SETTINGS").is_some()
-            {
+            if cfg!(feature = "dev-hooks") && std::env::var_os("SHOTLY_TEST_SETTINGS").is_some() {
                 self.open_settings();
             }
-            // Dev aid (only with `--features dev-hooks`): SCREENSHOOT_TEST_TOAST=1
+            // Dev aid (only with `--features dev-hooks`): SHOTLY_TEST_TOAST=1
             // shows a sample notice right away.
-            if cfg!(feature = "dev-hooks") && std::env::var_os("SCREENSHOOT_TEST_TOAST").is_some() {
+            if cfg!(feature = "dev-hooks") && std::env::var_os("SHOTLY_TEST_TOAST").is_some() {
                 let notice = Notice::new("Saved — click to show in Finder", Duration::from_secs(4))
                     .detail("Screenshot 2026-11-10 at 12.00.00.png");
                 self.show_notice(el, None, ToastStyle::from(&self.cfg), notice);
             }
-            // Dev aid (only with `--features dev-hooks`): SCREENSHOOT_TEST_CAPTURE=1
+            // Dev aid (only with `--features dev-hooks`): SHOTLY_TEST_CAPTURE=1
             // starts a capture after 1 s, through the same path as the menu item.
-            if cfg!(feature = "dev-hooks") && std::env::var_os("SCREENSHOOT_TEST_CAPTURE").is_some()
-            {
-                self.pending_capture = Some(Instant::now() + Duration::from_secs(1));
+            if cfg!(feature = "dev-hooks") && std::env::var_os("SHOTLY_TEST_CAPTURE").is_some() {
+                self.pending_capture =
+                    Some((Instant::now() + Duration::from_secs(1), Mode::Screenshot));
+            }
+            // Dev aid (only with `--features dev-hooks`): SHOTLY_TEST_RECORD=1
+            // starts the area picker for a recording after 1 s.
+            if cfg!(feature = "dev-hooks") && std::env::var_os("SHOTLY_TEST_RECORD").is_some() {
+                self.pending_capture =
+                    Some((Instant::now() + Duration::from_secs(1), Mode::Record));
             }
         }
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: AppEvent) {
         match event {
-            AppEvent::HotKey => self.start_capture(el),
+            AppEvent::HotKey(id) => {
+                if self.record_hotkey.is_some_and(|h| h.id() == id) {
+                    self.toggle_recording(el);
+                } else if self.hotkey.is_some_and(|h| h.id() == id) {
+                    self.start_capture(el, Mode::Screenshot);
+                }
+            }
             AppEvent::Menu(id) => self.menu_event(el, &id),
             AppEvent::ConfigChanged(cfg) => self.apply_config(el, cfg),
             AppEvent::PreviewToast(cfg) => {
@@ -399,6 +443,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.show_notice(el, None, ToastStyle::from(&cfg), notice);
             }
             AppEvent::SettingsClosed => self.settings = None,
+            AppEvent::RecordingDone => self.recording_done(el),
         }
     }
 
@@ -435,14 +480,18 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        debug_assert!(self.flow_matches_data(), "{:?}", self.flow.phase());
         if let Some(s) = &mut self.session {
             s.flush();
         }
         let now = Instant::now();
-        if self.pending_capture.is_some_and(|t| t <= now) {
+        if let Some((at, mode)) = self.pending_capture
+            && at <= now
+        {
             self.pending_capture = None;
-            self.start_capture(el);
+            self.start_capture(el, mode);
         }
+        let recording_wake = self.tick_recording(el, now);
         // Move the notice along its animation; it asks when to be woken next.
         let toast_wake = match self.toast.as_mut().map(|t| t.step(now)) {
             Some(Step::Wait(at)) => Some(at),
@@ -453,7 +502,8 @@ impl ApplicationHandler<AppEvent> for App {
             None => None,
         };
         let next = [
-            self.pending_capture,
+            self.pending_capture.map(|(at, _)| at),
+            recording_wake,
             toast_wake,
             self.session
                 .as_ref()
@@ -469,64 +519,54 @@ impl ApplicationHandler<AppEvent> for App {
     }
 }
 
-/// Menu shows the shortcut next to "Capture Area" (display only).
-fn config_accelerator(hotkey: &str) -> Option<tray_icon::menu::accelerator::Accelerator> {
-    hotkey.parse().ok()
+/// Whether the colour, size or preset the session ended with differs from
+/// what the config remembers.
+fn choices_changed(cfg: &Config, done: &Finished) -> bool {
+    done.color != cfg.color
+        || config::parse_width(&cfg.width) != Some(done.width)
+        || done.preset != cfg.preset
 }
 
-/// Template image: viewfinder corners, 22 pt at 2x.
-fn tray_icon_image() -> Icon {
-    let size = 44u32;
-    let mut pm = tiny_skia::Pixmap::new(size, size).unwrap();
-    let paint = crate::paint::paint(0x000000, 255);
-    let stroke = crate::paint::round_stroke(3.5);
-    let (a, b, l) = (8.0f32, 36.0f32, 9.0f32);
-    let mut pb = tiny_skia::PathBuilder::new();
-    for (x, y, dx, dy) in [
-        (a, a, 1.0, 1.0),
-        (b, a, -1.0, 1.0),
-        (a, b, 1.0, -1.0),
-        (b, b, -1.0, -1.0),
-    ] {
-        pb.move_to(x, y + dy * l);
-        pb.line_to(x, y);
-        pb.line_to(x + dx * l, y);
+/// "Saved": the file's name, and a click shows it in Finder.
+fn saved_notice(title: &str, path: std::path::PathBuf) -> Notice {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Notice::new(title, TOAST_LONG)
+        .detail(name)
+        .on_click(OnClick::Reveal(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Preset;
+    use crate::style::Width;
+
+    fn finished(color: usize, width: Width, preset: Preset) -> Finished {
+        Finished {
+            outcome: Outcome::Cancelled,
+            color,
+            width,
+            preset,
+            display: (0, 0, 100, 100),
+        }
     }
-    pm.stroke_path(
-        &pb.finish().unwrap(),
-        &paint,
-        &stroke,
-        tiny_skia::Transform::identity(),
-        None,
-    );
-    // Arrow across the frame, like the app icon.
-    let id = tiny_skia::Transform::identity();
-    let mut shaft = tiny_skia::PathBuilder::new();
-    shaft.move_to(15.0, 29.0);
-    shaft.line_to(25.0, 19.0);
-    pm.stroke_path(
-        &shaft.finish().unwrap(),
-        &paint,
-        &crate::paint::round_stroke(4.5),
-        id,
-        None,
-    );
-    let mut head = tiny_skia::PathBuilder::new();
-    head.move_to(31.0, 13.0);
-    head.line_to(21.0, 15.5);
-    head.line_to(28.5, 23.0);
-    head.close();
-    pm.fill_path(
-        &head.finish().unwrap(),
-        &paint,
-        tiny_skia::FillRule::Winding,
-        id,
-        None,
-    );
-    // Demultiply: tray-icon expects straight RGBA.
-    let rgba = pm.pixels().iter().flat_map(|p| {
-        let c = p.demultiply();
-        [c.red(), c.green(), c.blue(), c.alpha()]
-    });
-    Icon::from_rgba(rgba.collect(), size, size).expect("valid icon")
+
+    #[test]
+    fn only_a_changed_colour_size_or_preset_is_saved() {
+        let cfg = Config::default();
+        let same = finished(cfg.color, cfg.width(), cfg.preset);
+        assert!(!choices_changed(&cfg, &same));
+        assert!(choices_changed(&cfg, &finished(3, cfg.width(), cfg.preset)));
+        assert!(choices_changed(
+            &cfg,
+            &finished(cfg.color, Width::L, cfg.preset)
+        ));
+        assert!(choices_changed(
+            &cfg,
+            &finished(cfg.color, cfg.width(), Preset::Full)
+        ));
+    }
 }

@@ -49,6 +49,7 @@ pub struct Layers {
     caret: Retained<CALayer>,
     toolbar: Retained<CALayer>,
     flyout: Retained<CALayer>,
+    strip: Retained<CALayer>,
     label: Retained<CALayer>,
     tip: Retained<CALayer>,
     /// Caches so unchanged rasters are not redone.
@@ -56,6 +57,7 @@ pub struct Layers {
     ink_rect: Rect,
     toolbar_key: Option<(Rect, toolbar::State)>,
     flyout_key: Option<(Rect, toolbar::State)>,
+    strip_key: Option<(Rect, toolbar::State)>,
     label_key: Option<(i32, i32)>,
     tip_key: Option<String>,
     tip_size: (i32, i32),
@@ -136,10 +138,11 @@ impl Layers {
         let caret = new_layer(&root);
         let toolbar = new_layer(&root);
         let flyout = new_layer(&root);
+        let strip = new_layer(&root);
         let label = new_layer(&root);
         // Last, so it draws above everything else.
         let tip = new_layer(&root);
-        for l in [&toolbar, &flyout, &label, &tip] {
+        for l in [&toolbar, &flyout, &strip, &label, &tip] {
             l.setContentsScale(scale.get());
         }
         CATransaction::commit();
@@ -161,12 +164,14 @@ impl Layers {
             caret,
             toolbar,
             flyout,
+            strip,
             label,
             tip,
             ink_key: None,
             ink_rect: Rect::new(0, 0, 0, 0),
             toolbar_key: None,
             flyout_key: None,
+            strip_key: None,
             label_key: None,
             tip_key: None,
             tip_size: (0, 0),
@@ -345,6 +350,8 @@ impl Layers {
         sync_bar(layer, key, ed.toolbar(), &state, self.scale, &self.space);
         let (layer, key) = (&self.flyout, &mut self.flyout_key);
         sync_bar(layer, key, ed.flyout(), &state, self.scale, &self.space);
+        let (layer, key) = (&self.strip, &mut self.strip_key);
+        sync_bar(layer, key, ed.strip(), &state, self.scale, &self.space);
     }
 
     /// Tooltip for the hovered toolbar button, once the hover delay passed.
@@ -466,7 +473,7 @@ fn fade_in(layer: &CALayer, seconds: f64) {
 
 /// Wraps premultiplied RGBA pixels as a `CGImage` in the screen's colour
 /// space, so painted regions match the screen layer exactly.
-fn image(pm: &Pixmap, space: &CGColorSpace) -> CFRetained<CGImage> {
+pub fn image(pm: &Pixmap, space: &CGColorSpace) -> CFRetained<CGImage> {
     let data = CFData::from_bytes(pm.data());
     let provider = CGDataProvider::with_cf_data(Some(&data)).expect("data provider");
     let w = pm.width() as usize;
@@ -500,8 +507,10 @@ fn rect_pt(r: Rect, scale: Scale) -> CGRect {
     )
 }
 
-fn set_contents(l: &CALayer, img: Option<&CGImage>) {
-    // SAFETY: CGImage is a CF type toll-free usable as layer contents.
+pub(crate) fn set_contents(l: &CALayer, img: Option<&CGImage>) {
+    // SAFETY: a CGImage is a Core Foundation object, which Core Animation
+    // accepts as layer contents (the documented way to set an image); the
+    // reference lives as long as the call and the layer retains what it needs.
     unsafe {
         let obj = img.map(|i| &*(i as *const CGImage as *const AnyObject));
         l.setContents(obj);

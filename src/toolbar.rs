@@ -3,6 +3,7 @@
 
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
 
+use crate::config::Preset;
 use crate::geom::{Point, Rect, Scale};
 use crate::paint::{paint, round_stroke};
 use crate::shape::Kind;
@@ -59,7 +60,19 @@ pub enum Item {
     Redo,
     Copy,
     Save,
+    /// Start recording the selection (record mode only).
+    Record,
     Close,
+    /// Full screen / Window / Custom, in the strip at the top.
+    Preset(Preset),
+}
+
+/// Text on a preset button; `None` for buttons drawn as icons.
+fn label_of(item: Item) -> Option<String> {
+    match item {
+        Item::Preset(p) => Some(p.name().into()),
+        _ => None,
+    }
 }
 
 /// What the toolbar should highlight.
@@ -69,6 +82,7 @@ pub struct State {
     pub color: usize,
     pub width: Width,
     pub text_bg: bool,
+    pub preset: Preset,
     /// Last tool picked in each tool group (shown on its button).
     pub shape_tool: Tool,
     pub draw_tool: Tool,
@@ -92,7 +106,10 @@ const MARGIN_PT: f64 = 8.0;
 /// Space between the toolbar and an open flyout.
 const FLYOUT_GAP_PT: f64 = 4.0;
 
-fn groups() -> Vec<Vec<Item>> {
+fn groups(record: bool) -> Vec<Vec<Item>> {
+    if record {
+        return vec![vec![Item::Record, Item::Close]];
+    }
     vec![
         vec![
             Item::Tool(Tool::Select),
@@ -125,6 +142,17 @@ pub fn tooltip(item: Item) -> String {
         Item::Redo => "Redo (⇧⌘Z)".into(),
         Item::Copy => "Copy to clipboard (↩ or ⌘C)".into(),
         Item::Save => "Save to file (⌘S)".into(),
+        Item::Record => "Start recording (↩)".into(),
+        Item::Preset(Preset::Full) => {
+            format!("Full screen: the whole display ({})", Preset::Full.key())
+        }
+        Item::Preset(Preset::Window) => format!("Window: click one ({})", Preset::Window.key()),
+        Item::Preset(Preset::Custom) => {
+            format!(
+                "Custom: drag an area with the mouse ({})",
+                Preset::Custom.key()
+            )
+        }
         Item::Close => "Cancel (Esc)".into(),
     }
 }
@@ -197,16 +225,63 @@ pub fn flyout(tb: &Toolbar, group: Group, bounds: Rect, scale: Scale) -> Option<
     Some(row(vec![items], x, y, cell, pad, 0))
 }
 
+const TEXT_PT: f32 = 12.5;
+const CELL_PAD_X_PT: f64 = 10.0;
+const CELL_GAP_PT: f64 = 2.0;
+/// Clear of the notch on `MacBook` displays, which is about 32 pt tall.
+const STRIP_TOP_PT: f64 = 48.0;
+
+/// A row of text buttons whose top is at `y`, centred on `centre_x` and kept
+/// inside `bounds`.
+fn text_bar(items: &[Item], y: i32, centre_x: i32, bounds: Rect, scale: Scale) -> Toolbar {
+    let (cell, pad, gap) = (scale.px(CELL_PT), scale.px(PAD_PT), scale.px(CELL_GAP_PT));
+    let (cell_pad, margin) = (scale.px(CELL_PAD_X_PT), scale.px(MARGIN_PT));
+    let size = scale.pxf(TEXT_PT);
+    let widths: Vec<i32> = items
+        .iter()
+        .map(|&i| {
+            let text = label_of(i).unwrap_or_default();
+            crate::text::layout(&text, size).w.ceil() as i32 + 2 * cell_pad
+        })
+        .collect();
+    let total = widths.iter().sum::<i32>() + gap * (items.len() as i32 - 1).max(0) + 2 * pad;
+    let x = (centre_x - total / 2).clamp(
+        bounds.x + margin,
+        (bounds.right() - total - margin).max(bounds.x),
+    );
+    let mut cx = x + pad;
+    let cells = items
+        .iter()
+        .zip(&widths)
+        .map(|(&item, &w)| {
+            let r = Rect::new(cx, y + pad, w, cell);
+            cx += w + gap;
+            (item, r)
+        })
+        .collect();
+    Toolbar {
+        rect: Rect::new(x, y, total, cell + 2 * pad),
+        items: cells,
+    }
+}
+
+/// The Full screen / Window / Custom strip at the top of a display.
+pub fn strip(bounds: Rect, scale: Scale) -> Toolbar {
+    let items = Preset::ALL.map(Item::Preset);
+    let y = bounds.y + scale.px(STRIP_TOP_PT);
+    text_bar(&items, y, bounds.x + bounds.w / 2, bounds, scale)
+}
+
 /// Places the toolbar under `area`, or above it, or inside its bottom edge,
 /// whichever fits inside `bounds` first.
-pub fn layout(area: Rect, bounds: Rect, scale: Scale) -> Toolbar {
+pub fn layout(area: Rect, bounds: Rect, scale: Scale, record: bool) -> Toolbar {
     let (cell, pad, gap, margin) = (
         scale.px(CELL_PT),
         scale.px(PAD_PT),
         scale.px(GAP_PT),
         scale.px(MARGIN_PT),
     );
-    let probe = row(groups(), 0, 0, cell, pad, gap);
+    let probe = row(groups(record), 0, 0, cell, pad, gap);
     let (w, h) = (probe.rect.w, probe.rect.h);
 
     let x = area.centered_x(w, &bounds, margin);
@@ -219,7 +294,7 @@ pub fn layout(area: Rect, bounds: Rect, scale: Scale) -> Toolbar {
     } else {
         (area.bottom() - margin - h).max(bounds.y + margin)
     };
-    row(groups(), x, y, cell, pad, gap)
+    row(groups(record), x, y, cell, pad, gap)
 }
 
 impl Toolbar {
@@ -245,7 +320,9 @@ impl Toolbar {
 
         for &(item, r) in &self.items {
             let (x, y, c) = (r.x as f32 - ox, r.y as f32 - oy, r.w as f32);
+            let ch = r.h as f32;
             let active = match item {
+                Item::Preset(p) => p == st.preset,
                 Item::Group(g) => st.open == Some(g) || Group::of_tool(st.tool) == Some(g),
                 Item::Tool(t) => t == st.tool,
                 Item::Width(w) => w == st.width,
@@ -254,7 +331,7 @@ impl Toolbar {
             };
             if active || st.hover == Some(item) {
                 let alpha = if active { 50 } else { 24 };
-                let hl = rounded_rect(x + 1.0, y + 1.0, c - 2.0, c - 2.0, 6.0 * s);
+                let hl = rounded_rect(x + 1.0, y + 1.0, c - 2.0, ch - 2.0, 6.0 * s);
                 pm.fill_path(
                     &hl,
                     &paint(theme::HIGHLIGHT, alpha),
@@ -262,6 +339,19 @@ impl Toolbar {
                     Transform::identity(),
                     None,
                 );
+            }
+            if let Some(label) = label_of(item) {
+                let size = TEXT_PT * s;
+                let l = crate::text::layout(&label, size);
+                l.draw(
+                    &mut pm.as_mut(),
+                    x + (c - l.w) / 2.0,
+                    y + (ch - l.h) / 2.0,
+                    size,
+                    &paint(INK, 235),
+                    Transform::identity(),
+                );
+                continue;
             }
             let enabled = match item {
                 Item::Undo => st.can_undo,
@@ -316,6 +406,9 @@ fn draw_icon(
         Item::Redo => ic.curved_arrow(true),
         Item::Copy => ic.copy(),
         Item::Save => ic.save(),
+        Item::Record => ic.record_dot(),
+        // Drawn as text by `Toolbar::draw`.
+        Item::Preset(_) => {}
         Item::Close => {
             ic.stroke(&[(0.1, 0.1), (0.9, 0.9)], false);
             ic.stroke(&[(0.9, 0.1), (0.1, 0.9)], false);
@@ -569,6 +662,20 @@ impl<'a> Icon<'a> {
         self.stroke(&[(0.0, 0.7), (0.0, 1.0), (1.0, 1.0), (1.0, 0.7)], false);
     }
 
+    /// Red dot: start recording.
+    fn record_dot(&mut self) {
+        let (x, y, c) = self.cell;
+        if let Some(dot) = PathBuilder::from_circle(x + c / 2.0, y + c / 2.0, c * 0.28) {
+            self.pm.fill_path(
+                &dot,
+                &paint(0xFF3B30, 255),
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+    }
+
     /// ▾ in the corner: this button opens more choices.
     fn chevron(&mut self) {
         let (x, y, c) = self.cell;
@@ -594,22 +701,22 @@ mod tests {
 
     #[test]
     fn sits_below_selection_when_room() {
-        let tb = layout(Rect::new(1000, 500, 800, 400), SCREEN, Scale(2.0));
+        let tb = layout(Rect::new(1000, 500, 800, 400), SCREEN, Scale(2.0), false);
         assert_eq!(tb.rect.y, 900 + 16);
         assert!(tb.rect.x >= 16 && tb.rect.right() <= 3000 - 16);
     }
 
     #[test]
     fn flips_above_then_inside() {
-        let tb = layout(Rect::new(100, 600, 800, 1400), SCREEN, Scale(2.0));
+        let tb = layout(Rect::new(100, 600, 800, 1400), SCREEN, Scale(2.0), false);
         assert_eq!(tb.rect.bottom(), 600 - 16);
-        let full = layout(SCREEN, SCREEN, Scale(2.0));
+        let full = layout(SCREEN, SCREEN, Scale(2.0), false);
         assert_eq!(full.rect.bottom(), 2000 - 16);
     }
 
     #[test]
     fn hit_finds_items() {
-        let tb = layout(Rect::new(1000, 500, 800, 400), SCREEN, Scale(2.0));
+        let tb = layout(Rect::new(1000, 500, 800, 400), SCREEN, Scale(2.0), false);
         let (item, r) = tb.items[1];
         assert_eq!(item, Item::Group(Group::Shapes));
         assert_eq!(tb.hit(Point::new(r.x + 5, r.y + 5)), Some(item));
@@ -619,12 +726,41 @@ mod tests {
     }
 
     #[test]
+    fn record_mode_toolbar_has_only_record_and_close() {
+        let tb = layout(Rect::new(1000, 500, 800, 400), SCREEN, Scale(2.0), true);
+        let items: Vec<Item> = tb.items.iter().map(|&(i, _)| i).collect();
+        assert_eq!(items, vec![Item::Record, Item::Close]);
+        assert!(tooltip(Item::Record).contains("recording"));
+    }
+
+    #[test]
+    fn strip_is_centred_at_the_top_below_the_notch() {
+        let bounds = SCREEN;
+        let strip = strip(bounds, Scale(2.0));
+        let items: Vec<Item> = strip.items.iter().map(|&(i, _)| i).collect();
+        assert_eq!(items, Preset::ALL.map(Item::Preset).to_vec());
+        assert!(strip.rect.y >= 96, "below the notch: {:?}", strip.rect);
+        let mid = strip.rect.x + strip.rect.w / 2;
+        assert!((mid - bounds.w / 2).abs() <= 2, "{mid}");
+        // Buttons are wide enough for their text and do not overlap.
+        for w in strip.items.windows(2) {
+            assert!(w[0].1.right() <= w[1].1.x);
+        }
+        let (_, first) = strip.items[0];
+        assert_eq!(
+            strip.hit(Point::new(first.x + 3, first.y + 3)),
+            Some(Item::Preset(Preset::Full))
+        );
+    }
+
+    #[test]
     fn every_button_has_a_tooltip() {
-        let tb = layout(Rect::new(1000, 500, 800, 400), SCREEN, Scale(2.0));
+        let tb = layout(Rect::new(1000, 500, 800, 400), SCREEN, Scale(2.0), false);
         let mut items: Vec<Item> = tb.items.iter().map(|&(i, _)| i).collect();
         for g in [Group::Shapes, Group::Draw, Group::Color, Group::Size] {
             items.extend(g.items());
         }
+        items.extend(Preset::ALL.map(Item::Preset));
         for item in items {
             assert!(tooltip(item).len() > 2, "{item:?}");
         }
@@ -659,7 +795,7 @@ mod tests {
 
     #[test]
     fn flyout_opens_under_its_button_or_above_toolbar() {
-        let tb = layout(Rect::new(1000, 500, 800, 400), SCREEN, Scale(2.0));
+        let tb = layout(Rect::new(1000, 500, 800, 400), SCREEN, Scale(2.0), false);
         let button = tb
             .items
             .iter()
@@ -676,7 +812,7 @@ mod tests {
         );
 
         // Toolbar pinned to the bottom edge: flyout goes above it.
-        let low = layout(Rect::new(100, 600, 800, 1400), SCREEN, Scale(2.0));
+        let low = layout(Rect::new(100, 600, 800, 1400), SCREEN, Scale(2.0), false);
         let low = Toolbar {
             rect: Rect::new(low.rect.x, 1900, low.rect.w, low.rect.h),
             items: low.items,

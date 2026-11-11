@@ -1,16 +1,16 @@
 [package]
-name = "screenshoot"
-version = "0.1.0"
+name = "shotly"
+version = "0.2.0"
 edition = "2024"
 # Let-chains (`if let … && …`) need 1.88.
 rust-version = "1.88"
 license = "MIT"
-description = "A macOS menu-bar screenshot tool with annotations"
-repository = "https://github.com/m-biriukov/screenshoot"
+description = "A macOS menu-bar screenshot and screen-recording tool with annotations"
+repository = "https://github.com/m-biriukov/shotly"
 
 [features]
-# Developer-only switches (SCREENSHOOT_PROFILE, SCREENSHOOT_TEST_CAPTURE,
-# SCREENSHOOT_TEST_TOAST, SCREENSHOOT_TEST_SETTINGS). Off in normal builds so
+# Developer-only switches (SHOTLY_PROFILE, SHOTLY_TEST_CAPTURE,
+# SHOTLY_TEST_TOAST, SHOTLY_TEST_SETTINGS, SHOTLY_TEST_RECORD). Off in normal builds so
 # the installed app ignores those variables.
 dev-hooks = []
 
@@ -38,7 +38,16 @@ objc2-screen-capture-kit = { version = "0.3", default-features = false, features
     "SCScreenshotManager",
     "SCShareableContent",
     "SCStream",
+    "SCRecordingOutput",
+    "objc2-av-foundation",
+    "objc2-core-media",
 ] }
+objc2-av-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "AVCaptureDevice",
+    "AVMediaFormat",
+] }
+objc2-core-media = "0.3"
 raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
 skrifa = "0.49.0"
