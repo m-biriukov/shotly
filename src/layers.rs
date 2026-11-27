@@ -25,7 +25,7 @@ use winit::window::Window;
 
 use crate::editor::Editor;
 use crate::geom::{Handle, Rect, Scale};
-use crate::paint;
+use crate::paint::{self, Ink};
 use crate::render::{self, Backdrop};
 use crate::shape::ShapeHandle;
 use crate::theme::{self, ACCENT};
@@ -47,6 +47,8 @@ pub struct Layers {
     sel_outline: Retained<CALayer>,
     sel_handles: Vec<Retained<CALayer>>,
     caret: Retained<CALayer>,
+    /// Boxes over the selected words.
+    words: Retained<CALayer>,
     toolbar: Retained<CALayer>,
     flyout: Retained<CALayer>,
     strip: Retained<CALayer>,
@@ -58,7 +60,8 @@ pub struct Layers {
     toolbar_key: Option<(Rect, toolbar::State)>,
     flyout_key: Option<(Rect, toolbar::State)>,
     strip_key: Option<(Rect, toolbar::State)>,
-    label_key: Option<(i32, i32)>,
+    label_key: Option<(i32, i32, Option<&'static str>)>,
+    words_key: Option<(Vec<Rect>, u32, u8, bool)>,
     tip_key: Option<String>,
     tip_size: (i32, i32),
 }
@@ -120,6 +123,8 @@ impl Layers {
         for l in [&ink, &active] {
             l.setContentsScale(scale.get());
         }
+        // Over the shapes, under the selection border and handles.
+        let words = new_layer(&root);
         let border = new_layer(&root);
         border.setBorderColor(Some(&color(ACCENT, 1.0)));
         border.setBorderWidth(scale.pt(scale.hairline()));
@@ -140,6 +145,7 @@ impl Layers {
         let flyout = new_layer(&root);
         let strip = new_layer(&root);
         let label = new_layer(&root);
+        words.setContentsScale(scale.get());
         // Last, so it draws above everything else.
         let tip = new_layer(&root);
         for l in [&toolbar, &flyout, &strip, &label, &tip] {
@@ -162,6 +168,7 @@ impl Layers {
             sel_outline,
             sel_handles,
             caret,
+            words,
             toolbar,
             flyout,
             strip,
@@ -173,6 +180,7 @@ impl Layers {
             flyout_key: None,
             strip_key: None,
             label_key: None,
+            words_key: None,
             tip_key: None,
             tip_size: (0, 0),
         })
@@ -250,6 +258,7 @@ impl Layers {
         self.sync_caret(ed);
         self.sync_toolbar(ed);
         self.sync_label(ed, shown);
+        self.sync_words(ed);
         self.sync_tip(ed, tip_visible);
         CATransaction::commit();
     }
@@ -288,13 +297,16 @@ impl Layers {
             .active_shape()
             .zip(bd)
             .and_then(|(s, bd)| render::active(bd, s));
-        let Some((r, pm, multiply)) = painted else {
+        let Some((r, pm, ink)) = painted else {
             set_contents(&self.active, None);
             show(&self.active, false);
             return;
         };
         set_contents(&self.active, Some(&self.image(&pm)));
-        let filter = multiply.then(|| ns_string!("multiplyBlendMode"));
+        let filter = ink.map(|ink| match ink {
+            Ink::Darken => ns_string!("multiplyBlendMode"),
+            Ink::Lighten => ns_string!("screenBlendMode"),
+        });
         // SAFETY: compositingFilter accepts a filter name string.
         unsafe {
             self.active
@@ -380,8 +392,12 @@ impl Layers {
         let Some(a) = shown else {
             return show(&self.label, false);
         };
-        if self.label_key != Some((a.w, a.h)) {
-            let pm = render::size_label(a.w, a.h, self.scale);
+        let status = ed.text_status();
+        if self.label_key != Some((a.w, a.h, status)) {
+            let pm = match status {
+                Some(text) => render::pill(text, self.scale),
+                None => render::size_label(a.w, a.h, self.scale),
+            };
             set_contents(&self.label, Some(&self.image(&pm)));
             self.label.setBounds(CGRect::new(
                 CGPoint::new(0.0, 0.0),
@@ -390,7 +406,7 @@ impl Layers {
                     self.scale.pt(pm.height() as i32),
                 ),
             ));
-            self.label_key = Some((a.w, a.h));
+            self.label_key = Some((a.w, a.h, status));
         }
         // Above the top-left corner, or just inside when there is no room or
         // the toolbar sits above the selection.
@@ -407,6 +423,31 @@ impl Layers {
             size,
         ));
         show(&self.label, true);
+    }
+
+    /// The translucent boxes over the selected words.
+    fn sync_words(&mut self, ed: &Editor) {
+        let Some((rects, rgb, alpha, strokes)) = ed.text_highlight() else {
+            self.words_key = None;
+            return show(&self.words, false);
+        };
+        let key = (rects, rgb, alpha, strokes);
+        if self.words_key.as_ref() != Some(&key) {
+            // Marker strokes reach a little past their boxes.
+            let bounds = key
+                .0
+                .iter()
+                .map(|r| r.expand(paint::marker_margin(r.h)))
+                .reduce(|a, b| a.union(&b));
+            if let Some((r, pm)) =
+                bounds.and_then(|r| Some((r, render::selection(r, &key.0, rgb, alpha, strokes)?)))
+            {
+                set_contents(&self.words, Some(&self.image(&pm)));
+                self.words.setFrame(self.pt(r));
+            }
+            self.words_key = Some(key);
+        }
+        show(&self.words, true);
     }
 
     fn image(&self, pm: &Pixmap) -> CFRetained<CGImage> {

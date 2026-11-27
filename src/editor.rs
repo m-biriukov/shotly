@@ -6,16 +6,20 @@ mod history;
 mod presets;
 mod text_edit;
 mod ui;
+mod words;
 
 use history::History;
 pub use text_edit::EditKey;
 use text_edit::TextEdit;
 use ui::{Snapping, ToolbarUi};
+pub use words::{Reading, TextLayer};
 
-use crate::config::Preset;
+use crate::config::{Preset, RecordOptions};
 use crate::geom::{Handle, Hit, Point, Rect, Scale, Selection};
+use crate::ocr::Word;
 use crate::shape::{Kind, Shape, ShapeHandle, Style};
 use crate::style::{PALETTE, Tool, Width};
+use crate::theme::ACCENT;
 use crate::toolbar::{self, Item, Toolbar};
 
 /// What the window should do after an input event.
@@ -23,6 +27,8 @@ use crate::toolbar::{self, Item, Toolbar};
 pub enum Action {
     Copy,
     Save,
+    /// Copy the selected text (Select-text tool).
+    CopyText,
     /// Start recording the selected area (record mode).
     Record,
     Cancel,
@@ -31,6 +37,8 @@ pub enum Action {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cursor {
     Crosshair,
+    /// A crosshair in a palette colour: a press here draws with it.
+    Ink(usize),
     Move,
     Pointer,
     Text,
@@ -66,6 +74,8 @@ enum Drag {
         start: Point,
         orig: Shape,
     },
+    /// Selecting recognized words.
+    Words,
     /// Press already handled (toolbar, finishing a text edit); ignore until release.
     Ignore,
 }
@@ -77,6 +87,12 @@ struct Choices {
     color: usize,
     width: Width,
     text_bg: bool,
+}
+
+/// The box a highlight takes for a line of words: a little air around the
+/// letters.
+fn mark_box(line: Rect) -> Rect {
+    line.expand((line.h / 10).max(1))
 }
 
 /// Handle grab distance and shape hit tolerance, in points.
@@ -96,10 +112,13 @@ pub struct Editor {
     history: History<Vec<Shape>>,
     ui: ToolbarUi,
     snap: Snapping,
-    /// Picking an area to record: no drawing, a Record button instead of Copy/Save.
-    record: bool,
+    /// Picking an area to record (no drawing; the toolbar changes these
+    /// settings and starts the recording).
+    record: Option<RecordOptions>,
     /// How the area is picked: whole display, a window, or by hand.
     preset: Preset,
+    /// Recognized words and the selection over them.
+    words: TextLayer,
 }
 
 impl Editor {
@@ -124,16 +143,22 @@ impl Editor {
             history: History::default(),
             ui: ToolbarUi::default(),
             snap: Snapping::default(),
-            record: false,
+            record: None,
             preset: Preset::Custom,
+            words: TextLayer::default(),
         }
     }
 
-    /// Switches to picking an area to record: the select tool only, and a
-    /// toolbar with just Record and Close.
-    pub fn set_record_mode(&mut self) {
-        self.record = true;
+    /// Switches to picking an area to record: the select tool only, and the
+    /// recording toolbar, starting from `options`.
+    pub fn set_record_mode(&mut self, options: RecordOptions) {
+        self.record = Some(options);
         self.choices.tool = Tool::Select;
+    }
+
+    /// The recording settings as chosen so far (record mode only).
+    pub fn record_options(&self) -> Option<RecordOptions> {
+        self.record
     }
 
     /// Starting colour and size (no shape is touched).
@@ -248,7 +273,7 @@ impl Editor {
             return None;
         }
         self.area()
-            .map(|a| toolbar::layout(a, self.bounds, self.scale, self.record))
+            .map(|a| toolbar::layout(a, self.bounds, self.scale, self.record.is_some()))
     }
 
     /// The open group's flyout, if any.
@@ -308,6 +333,114 @@ impl Editor {
         changed
     }
 
+    // ---- recognized text ----
+
+    /// A text tool is in use on an area and the words are not asked for yet.
+    pub fn wants_words(&self) -> bool {
+        self.record.is_none()
+            && self.choices.tool.uses_text()
+            && self.area().is_some()
+            && self.words.reading() == Reading::NotAsked
+    }
+
+    pub fn words_pending(&mut self) {
+        self.words.set_pending();
+    }
+
+    /// The answer is taking long; say why.
+    pub fn words_slow(&mut self) {
+        self.words.set_slow();
+    }
+
+    /// The recognizer's answer, in window pixels (`None`: it failed).
+    pub fn set_words(&mut self, words: Option<Vec<Word>>) {
+        match words {
+            Some(w) => self.words.set_words(w),
+            None => self.words.set_failed(),
+        }
+    }
+
+    /// What to say instead of the size while a text tool waits for words.
+    pub fn text_status(&self) -> Option<&'static str> {
+        let area = self.area().filter(|_| self.choices.tool.uses_text())?;
+        match self.words.reading() {
+            Reading::Pending => Some("Reading text…"),
+            Reading::Slow => Some("Preparing text recognition, first time takes a minute…"),
+            Reading::Failed => Some("Could not read text"),
+            Reading::Ready if !self.words.has_words_in(area) => Some("No text found here"),
+            Reading::Ready | Reading::NotAsked => None,
+        }
+    }
+
+    /// The selection's line boxes, their colour and opacity, and whether they
+    /// preview marker strokes.
+    pub fn text_highlight(&self) -> Option<(Vec<Rect>, u32, u8, bool)> {
+        let area = self.area().filter(|_| self.choices.tool.uses_text())?;
+        let rects = self.words.selected_rects(area);
+        // The marker's preview is its stroke, padded as it will be painted.
+        let stroke = self.choices.tool == Tool::TextMark;
+        let (rects, rgb, alpha) = if stroke {
+            let padded = rects.into_iter().map(mark_box).collect();
+            (padded, PALETTE[self.choices.color], 190)
+        } else {
+            (rects, ACCENT, 90)
+        };
+        (!rects.is_empty()).then_some((rects, rgb, alpha, stroke))
+    }
+
+    /// Text that ⌘C would copy, and how many words it is.
+    pub fn copyable_text(&self) -> Option<(String, usize)> {
+        let area = self
+            .area()
+            .filter(|_| self.choices.tool == Tool::TextSelect)?;
+        let text = self.words.selected_text(area)?;
+        Some((text, self.words.selected_count(area)))
+    }
+
+    /// ⌘A under the Select-text tool. Returns whether it applied.
+    pub fn select_all_words(&mut self) -> bool {
+        match self.area() {
+            Some(area) if self.choices.tool == Tool::TextSelect => {
+                self.words.select_all(area);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Esc: lets go of the selected shape, or else of the selected words.
+    /// Returns whether there was anything to let go of (if not, Esc cancels
+    /// the capture).
+    pub fn deselect(&mut self) -> bool {
+        if self.drag.is_some() {
+            return false;
+        }
+        if self.selected.take().is_some() {
+            return true;
+        }
+        let words = self
+            .area()
+            .is_some_and(|a| self.words.selected_count(a) > 0);
+        self.words.clear();
+        words
+    }
+
+    /// Turns the words just swept over into highlights (one undo step).
+    fn mark_selected_words(&mut self) {
+        let Some(area) = self.area() else { return };
+        let rects = self.words.selected_rects(area);
+        self.words.clear();
+        if rects.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        let style = self.style_for(Kind::TextMark);
+        for r in rects {
+            self.shapes.push(Shape::text_mark(mark_box(r), style));
+        }
+        self.selected = None;
+    }
+
     pub fn toolbar_state(&self) -> toolbar::State {
         toolbar::State {
             tool: self.choices.tool,
@@ -321,6 +454,7 @@ impl Editor {
             can_undo: self.history.can_undo() || self.edit.is_some(),
             can_redo: self.history.can_redo(),
             hover: self.ui.hover,
+            record: self.record,
         }
     }
 
@@ -338,6 +472,7 @@ impl Editor {
         self.drag = None;
         self.draft = None;
         self.selected = None;
+        self.words.clear();
     }
 
     // ---- commands ----
@@ -373,6 +508,12 @@ impl Editor {
 
     pub fn set_tool(&mut self, tool: Tool) {
         self.finish_edit();
+        if tool != self.choices.tool {
+            self.words.clear();
+            if tool.uses_text() {
+                self.selected = None;
+            }
+        }
         self.choices.tool = tool;
         self.ui.remember(tool);
     }
@@ -454,6 +595,11 @@ impl Editor {
             Item::Save => return Some(Action::Save),
             Item::Record => return Some(Action::Record),
             Item::Preset(p) => self.choose_preset(p),
+            Item::Set(choice) => {
+                if let Some(options) = &mut self.record {
+                    options.apply(choice);
+                }
+            }
             Item::Close => return Some(Action::Cancel),
         }
         None
@@ -632,6 +778,18 @@ impl Editor {
         if let Hit::Handle(_) = self.area.hit(p) {
             return self.press_area(p);
         }
+        if self.choices.tool.uses_text() {
+            let slop = self.scale.px(words::SLOP_PT);
+            let area = self.area().filter(|a| a.contains(p));
+            self.drag = Some(match area {
+                Some(a) => {
+                    self.words.press(p, slop, a);
+                    Drag::Words
+                }
+                None => Drag::Ignore,
+            });
+            return;
+        }
         if (double || self.choices.tool == Tool::Text)
             && let Some(idx) = self.text_at(p)
         {
@@ -693,6 +851,10 @@ impl Editor {
                 changed
             }
             Some(Drag::Area) => self.area.motion(p),
+            Some(Drag::Words) => match self.area() {
+                Some(a) => self.words.drag(p, a),
+                None => false,
+            },
             Some(Drag::Draw) => {
                 if let Some(d) = &mut self.draft {
                     d.drag_to(p, shift);
@@ -736,6 +898,11 @@ impl Editor {
                     self.area.set_rect(r);
                 }
             }
+            Some(Drag::Words) => {
+                if self.choices.tool == Tool::TextMark {
+                    self.mark_selected_words();
+                }
+            }
             Some(Drag::Area) => {
                 self.area.release(p);
                 // A click (no drag) before any area exists picks the window under it.
@@ -770,6 +937,17 @@ impl Editor {
         }
     }
 
+    /// What the pointer looks like where the current tool would act: an
+    /// I-beam for the text tools, a crosshair in the ink colour for the tools
+    /// that draw.
+    fn tool_cursor(&self) -> Cursor {
+        match self.choices.tool {
+            Tool::Text | Tool::TextSelect => Cursor::Text,
+            Tool::Select => Cursor::Crosshair,
+            _ => Cursor::Ink(self.choices.color),
+        }
+    }
+
     pub fn cursor(&self, p: Point) -> Cursor {
         let area_cursor = |hit| match hit {
             Hit::Handle(h) => Cursor::Resize(h),
@@ -783,8 +961,10 @@ impl Editor {
                 ..
             }) => return Cursor::Resize(*h),
             // Drawing, or dragging a line/arrow endpoint.
-            Some(Drag::Draw | Drag::Handle { .. }) => return Cursor::Crosshair,
+            Some(Drag::Draw) => return Cursor::Ink(self.choices.color),
+            Some(Drag::Handle { .. }) => return Cursor::Crosshair,
             Some(Drag::Area) => return area_cursor(self.area.hit(p)),
+            Some(Drag::Words) => return self.tool_cursor(),
             Some(Drag::Ignore) | None => {}
         }
         if self.bar_at(p).is_some() {
@@ -813,8 +993,7 @@ impl Editor {
         match self.choices.tool {
             Tool::Select if self.shape_at(p).is_some() => Cursor::Move,
             Tool::Select => area_cursor(hit),
-            Tool::Text => Cursor::Text,
-            _ => Cursor::Crosshair,
+            _ => self.tool_cursor(),
         }
     }
 }
@@ -1108,6 +1287,191 @@ mod tests {
         drag(&mut e, (200, 300), (400, 400));
         assert_eq!(e.shapes()[1].kind, Kind::Pixelate);
         assert_eq!(e.shapes()[1].style.size, 16.0);
+    }
+
+    /// An area with "alpha beta" over "gamma" recognized in it, `tool` chosen.
+    fn editor_with_words(tool: Tool) -> Editor {
+        let mut e = editor_with_area();
+        e.set_tool(tool);
+        let word = |text: &str, x, y, line| Word {
+            text: text.into(),
+            rect: Rect::new(x, y, 80, 20),
+            line,
+        };
+        e.set_words(Some(vec![
+            word("alpha", 200, 200, 0),
+            word("beta", 300, 200, 0),
+            word("gamma", 200, 240, 1),
+        ]));
+        e
+    }
+
+    #[test]
+    fn words_are_asked_for_once_and_only_by_text_tools() {
+        let mut e = editor_with_area();
+        assert!(!e.wants_words(), "rectangle tool");
+        e.set_tool(Tool::TextSelect);
+        assert!(e.wants_words());
+        e.words_pending();
+        assert!(!e.wants_words());
+        assert_eq!(e.text_status(), Some("Reading text…"));
+        e.words_slow();
+        assert!(e.text_status().is_some_and(|s| s.contains("first time")));
+        e.set_words(None);
+        assert_eq!(e.text_status(), Some("Could not read text"));
+        e.set_words(Some(Vec::new()));
+        assert_eq!(e.text_status(), Some("No text found here"));
+        // Without an area there is nothing to read.
+        let mut e = Editor::new(Rect::new(0, 0, 2000, 1500), 1.0);
+        e.set_tool(Tool::TextMark);
+        assert!(!e.wants_words());
+        // Nor when picking an area to record.
+        let mut e = editor_with_area();
+        e.set_record_mode(crate::config::Config::default().record_options());
+        e.set_tool(Tool::TextSelect);
+        assert!(!e.wants_words());
+    }
+
+    #[test]
+    fn the_recording_toolbar_changes_settings_and_keeps_the_area() {
+        use crate::config::{RecordChoice, Switch};
+        let mut e = editor_with_area();
+        e.set_record_mode(crate::config::Config::default().record_options());
+        let area = e.area();
+        let click = |e: &mut Editor, item| {
+            let at = match e.flyout() {
+                Some(f) if f.items.iter().any(|(i, _)| *i == item) => center_of(&f, item),
+                _ => center_of(&e.toolbar().unwrap(), item),
+            };
+            let action = e.press(at, false);
+            e.release(at, false);
+            action
+        };
+        let mic = Item::Set(RecordChoice::Toggle(Switch::Mic));
+        for expected in [true, false, true] {
+            assert_eq!(click(&mut e, mic), None);
+            assert_eq!(e.record_options().unwrap().mic, expected);
+        }
+        // A group opens its choices; picking one closes them again.
+        click(&mut e, Item::Group(Group::LeftColor));
+        assert!(e.flyout().is_some());
+        click(&mut e, Item::Set(RecordChoice::LeftColor(3)));
+        assert_eq!(e.record_options().unwrap().left_click_color, 3);
+        assert!(e.flyout().is_none());
+        click(&mut e, Item::Group(Group::Fps));
+        click(&mut e, Item::Set(RecordChoice::Fps(60)));
+        assert_eq!(e.record_options().unwrap().fps, 60);
+        assert_eq!(e.area(), area);
+        assert!(e.shapes().is_empty());
+        assert_eq!(click(&mut e, Item::Record), Some(Action::Record));
+    }
+
+    #[test]
+    fn dragging_with_the_select_tool_selects_text_to_copy() {
+        let mut e = editor_with_words(Tool::TextSelect);
+        assert_eq!(e.text_status(), None);
+        assert_eq!(e.copyable_text(), None);
+        drag(&mut e, (210, 210), (230, 250));
+        assert_eq!(e.copyable_text(), Some(("alpha beta\ngamma".into(), 3)));
+        assert!(e.text_highlight().is_some());
+        assert!(e.shapes().is_empty(), "selecting draws nothing");
+        assert_eq!(e.area(), Some(Rect::new(100, 100, 800, 600)), "area stays");
+        // Beside the words the selection goes away.
+        click(&mut e, (700, 600), false);
+        assert_eq!(e.copyable_text(), None);
+        assert!(e.select_all_words());
+        assert_eq!(e.copyable_text().map(|(_, n)| n), Some(3));
+        e.set_tool(Tool::Rect);
+        assert_eq!(e.copyable_text(), None);
+        assert!(!e.select_all_words());
+    }
+
+    #[test]
+    fn dragging_with_the_marker_highlights_each_line_as_one_undo_step() {
+        let mut e = editor_with_words(Tool::TextMark);
+        e.set_color(2);
+        drag(&mut e, (210, 210), (230, 250));
+        let marks = e.shapes();
+        assert_eq!(marks.len(), 2, "one box per line");
+        assert!(marks.iter().all(|s| s.kind == Kind::TextMark));
+        assert!(marks.iter().all(|s| s.style.color == PALETTE[2]));
+        // Covers its words, with a little air.
+        assert_eq!(marks[0].bbox(), Rect::new(198, 198, 184, 24));
+        assert_eq!(e.text_highlight(), None, "no selection left over");
+        assert_eq!(e.copyable_text(), None, "the marker does not copy");
+        e.undo();
+        assert!(e.shapes().is_empty());
+        e.redo();
+        assert_eq!(e.shapes().len(), 2);
+    }
+
+    #[test]
+    fn a_marker_drag_away_from_words_does_nothing() {
+        let mut e = editor_with_words(Tool::TextMark);
+        drag(&mut e, (600, 500), (700, 550));
+        assert!(e.shapes().is_empty());
+        assert_eq!(e.area(), Some(Rect::new(100, 100, 800, 600)));
+    }
+
+    #[test]
+    fn drawing_tools_show_a_crosshair_in_the_ink_colour() {
+        // Picking the area itself keeps the plain crosshair.
+        let e = Editor::new(Rect::new(0, 0, 2000, 1500), 1.0);
+        assert_eq!(e.cursor(Point::new(500, 500)), Cursor::Crosshair);
+
+        let mut e = editor_with_area();
+        let inside = Point::new(400, 400);
+        for tool in [
+            Tool::Rect,
+            Tool::Ellipse,
+            Tool::Line,
+            Tool::Arrow,
+            Tool::Pen,
+            Tool::Highlighter,
+            Tool::Blur,
+            Tool::TextMark,
+        ] {
+            e.set_tool(tool);
+            assert_eq!(e.cursor(inside), Cursor::Ink(0), "{tool:?}");
+        }
+        e.set_color(4);
+        assert_eq!(e.cursor(inside), Cursor::Ink(4));
+        // Still coloured while the shape is being drawn.
+        e.set_tool(Tool::Pen);
+        e.press(inside, false);
+        assert_eq!(e.cursor(Point::new(450, 450)), Cursor::Ink(4));
+        e.release(Point::new(450, 450), false);
+        for tool in [Tool::Text, Tool::TextSelect] {
+            e.set_tool(tool);
+            assert_eq!(e.cursor(Point::new(700, 600)), Cursor::Text, "{tool:?}");
+        }
+        e.set_tool(Tool::Select);
+        assert_eq!(e.cursor(Point::new(700, 600)), Cursor::Move);
+        // Resize handles keep their arrows.
+        e.set_tool(Tool::Pen);
+        assert!(matches!(e.cursor(Point::new(100, 100)), Cursor::Resize(_)));
+    }
+
+    #[test]
+    fn escape_lets_go_of_a_selected_shape_before_anything_else() {
+        let mut e = editor_with_area();
+        e.set_tool(Tool::Rect);
+        drag(&mut e, (200, 200), (300, 300));
+        assert!(e.selected_shape().is_some());
+        assert!(e.deselect(), "first Esc: deselect");
+        assert!(e.selected_shape().is_none());
+        assert_eq!(e.shapes().len(), 1, "the shape stays");
+        assert!(!e.deselect(), "second Esc: nothing left, so it cancels");
+    }
+
+    #[test]
+    fn escape_lets_go_of_selected_words_too() {
+        let mut e = editor_with_words(Tool::TextSelect);
+        drag(&mut e, (210, 210), (330, 210));
+        assert!(e.copyable_text().is_some());
+        assert!(e.deselect());
+        assert_eq!(e.copyable_text(), None);
+        assert!(!e.deselect());
     }
 
     #[test]

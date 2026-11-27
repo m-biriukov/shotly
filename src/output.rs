@@ -47,6 +47,11 @@ pub fn copy_to_clipboard(img: &RgbaImage) -> Result<()> {
     .context("writing image to clipboard")
 }
 
+pub fn copy_text(text: &str) -> Result<()> {
+    let mut cb = arboard::Clipboard::new().context("opening clipboard")?;
+    cb.set_text(text).context("writing text to clipboard")
+}
+
 /// Saves `img` into `dir` as `name` (which includes the extension), adding
 /// " (2)", " (3)"… instead of overwriting. JPEG uses quality 90.
 pub fn save(img: &RgbaImage, dir: &Path, name: &str, format: Format) -> Result<PathBuf> {

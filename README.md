@@ -19,6 +19,10 @@ Written in Rust. Everything stays on your Mac: the app never uses the network.
 - **Annotate** with a rectangle, ellipse, line, arrow, pen, highlighter, text
   and a pixelate tool for hiding sensitive information. Eight colors, three
   sizes, optional background box behind text.
+- **Text in the picture:** select words right on the frozen screen and copy
+  them, or sweep across text with the highlight tool and the highlight snaps to
+  its words and lines. Recognition runs on your Mac (Apple's Vision
+  framework), in Latin, Cyrillic and other scripts.
 - **Edit afterwards:** every shape stays an object you can select, move,
   resize, recolor or delete, and double-click text to edit it again. Unlimited
   undo and redo.
@@ -184,8 +188,8 @@ Press the shortcut. A strip at the top of the screen offers three presets
 
 The size label above the selection shows its size in screen pixels (a Retina
 display has two pixels per point). A screenshot is saved at exactly that size;
-a video is too, unless Settings › Recording › Resolution is *Standard*, which
-records one pixel per point. You can still move and resize any selection with
+a video is too at *High* quality; *Medium* and *Low* (set in Settings or on the
+recording toolbar) scale it down. You can still move and resize any selection with
 its handles.
 
 A toolbar appears under the selection (hover any button for its name and
@@ -199,6 +203,8 @@ shortcut).
 | Draw ▾ | Pen, highlighter |
 | Text | Click and type; double-click a text to edit it again |
 | Blur | Pixelate a rectangle |
+| Select text | Drag across words, then ⌘C to copy them (⌘A: all words in the selection) |
+| Highlight text | Drag across words; each line gets a marker stroke in the current color. On dark backgrounds the ink lightens instead of darkening, so it stays visible |
 | Color ▾, Size ▾ | Palette, stroke/text/block size, text background box |
 | Undo, Redo | Step back and forward |
 | Copy, Save, Close | Finish, or cancel |
@@ -207,22 +213,45 @@ shortcut).
 | --- | --- |
 | V R O L A P H T B | Select, Rectangle, Ellipse, Line, Arrow, Pen, Highlighter, Text, Blur |
 | F W C | Preset: Full screen, Window, Custom |
+| S, M | Select text, Highlight text |
+| ⌘A (Select text) | Select every word in the selection |
 | Shift (while drawing) | Square, circle, 45° lines, straight highlighter |
 | ⌘Z, ⇧⌘Z | Undo, redo |
 | Delete | Delete the selected shape |
-| Return or ⌘C | Copy to the clipboard |
+| Return or ⌘C | Copy the picture to the clipboard (with text selected, ⌘C copies the text) |
 | ⌘S | Save to the folder from Settings |
-| Esc | Close a flyout, finish typing, or cancel the capture |
+| Esc | Close a flyout, finish typing, deselect the shape or text, then cancel the capture |
 
 Shortcuts work in any keyboard layout: on a Russian or Ukrainian layout the
 key in the R position is still R.
+
+While a drawing tool is on, the pointer is a crosshair in the current color
+(the text tools show an I-beam).
+
+The text tools read the picture the first time you use one in a capture (the
+label shows *Reading text…*). The first recognition after installing or
+updating the app takes about a minute while macOS loads its models; Shotly
+starts that in the background when it launches.
 
 ## Recording video
 
 Press the record shortcut, **⌘⇧1** by default (or menu-bar icon › **Record
 Screen**). The screen freezes as for a screenshot: drag an area or click a
-window (the same presets as for screenshots), adjust it with the handles, then
-click the red **Record** button or press Return. Esc cancels.
+window (the same presets as for screenshots) and adjust it with the handles.
+The toolbar under the area has every recording setting from
+[Settings](#settings) except the shortcut:
+
+| Toolbar | What it does |
+| --- | --- |
+| 30 ▾, quality ▾ | Frame rate; video quality |
+| Microphone, 3, frame | Record microphone, count down, frame around the area |
+| Pointer, color ▾, size ▾ | Highlight the mouse pointer, in which color and size |
+| Clicks, L ▾, R ▾ | Show mouse clicks; left and right click colors |
+| Red dot, ✕ | Start recording (or Return); cancel (or Esc) |
+
+A lit button is on; a struck-through one is off. Faded buttons have no effect
+as the others are set. Hover any button for its name. Changes apply to this
+recording and are saved for the next.
 
 After the countdown the recording starts and the menu-bar icon turns red and
 shows the elapsed time. Stop it with the same shortcut, or menu-bar icon ›
@@ -240,7 +269,7 @@ screenshots (click it to show the file in Finder).
 - While recording, the screenshot shortcut only shows a notice (its overlay
   would end up in the video), and **Settings…** is unavailable.
 - The area stays within one display.
-- Sound: only the microphone, and only if you turn it on in Settings. If
+- Sound: only the microphone, and only if you turn it on. If
   macOS denies the Microphone permission, the video is recorded without
   sound and the notice says so.
 
@@ -265,13 +294,14 @@ Menu-bar icon › **Settings…**. Three tabs:
 | Show notice | Turn the "Copied / Saved" notice off |
 | Position, size, distance from edge | **Preview** shows it without saving |
 
-**Recording**
+**Recording** (all but the shortcut can also be changed in the picker, just
+before a recording starts)
 
 | Setting | Notes |
 | --- | --- |
 | Record shortcut | Starts and stops a recording (default ⌘⇧1) |
 | Frame rate | 30 or 60 fps |
-| Resolution | Retina (the display's full pixels) or Standard (one pixel per point, about a quarter of the size) |
+| Video quality | High: the display's full pixels. Medium: 75% of that. Low: 50% (one pixel per point on Retina) and at most 30 fps. All are H.264 |
 | Record microphone | Off by default |
 | Count down 3-2-1, Show a frame around the area | On by default |
 | Highlight the mouse pointer, color, size | A halo around the pointer |
@@ -289,6 +319,7 @@ If you turn on **Record microphone**, macOS also asks for **Microphone**
 access. The pointer halo and click ripples work without any extra permission;
 the app does not watch the keyboard.
 
+- Text recognition happens on your Mac; the picture is not sent anywhere.
 - Screenshots are kept in memory until you copy or save them, and are never
   sent anywhere. Videos are written straight to the save folder. The app makes no network connections.
 - Saved files are readable only by you (mode `600`).
@@ -354,11 +385,12 @@ CI runs all four on every push.
 | App shell: menu bar, notices | `app.rs`, `toast.rs`, `tray.rs`, `login.rs`, `macos.rs` |
 | Global shortcuts | `app/hotkeys.rs` |
 | Capture (ScreenCaptureKit), window snapping | `capture.rs`, `snap.rs` |
+| Text recognition (Vision) and word selection | `ocr.rs`, `editor/words.rs` |
 | Video recording: state machine in the app, stream, halo, ripples, countdown | `app/recording.rs`, `record.rs`, `highlight.rs` |
 | Capture session and window events | `overlay.rs` |
 | Editing logic, no windowing (unit tested), presets | `editor.rs`, `editor/` (incl. `presets.rs`), `shape.rs`, `geom.rs`, `keys.rs` |
 | Drawing: shapes, text, export | `paint.rs`, `text.rs`, `output.rs` |
-| Overlay display (Core Animation layers) | `layers.rs`, `render.rs`, `toolbar.rs` |
+| Overlay display (Core Animation layers) | `layers.rs`, `render.rs`, `toolbar.rs`, `toolbar/record.rs` |
 | Settings and config | `settings.rs`, `config.rs` |
 | Look | `style.rs`, `theme.rs` |
 
@@ -370,6 +402,8 @@ on-screen overlay and the exported image, so what you see is what you save.
 - macOS only.
 - The overlay appears about 75–80 ms after the shortcut; ScreenCaptureKit
   alone needs about 60 ms of that.
+- Recognized text can be wrong for handwriting, tiny or low-contrast text, and
+  pages with several columns may be read in the wrong order.
 - Text supports Latin and Cyrillic and other simple scripts; there is no
   emoji, no right-to-left or complex-script shaping, and no kerning.
 - A selection, and so a recording, stays within one display.

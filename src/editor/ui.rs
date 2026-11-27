@@ -41,7 +41,7 @@ impl ToolbarUi {
         match group {
             Group::Shapes => Some(self.shape_tool),
             Group::Draw => Some(self.draw_tool),
-            Group::Color | Group::Size => None,
+            _ => None,
         }
     }
 }

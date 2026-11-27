@@ -245,11 +245,8 @@ impl Recording {
         let b = CGDisplayBounds(id);
         let display = (b.origin.x, b.origin.y, b.size.width, b.size.height);
         let (px_w, _) = capture::pixel_size(id, (b.size.width as usize, b.size.height as usize));
-        let scale = if cfg.record_retina {
-            px_w as f64 / b.size.width.max(1.0)
-        } else {
-            1.0
-        };
+        let native = px_w as f64 / b.size.width.max(1.0);
+        let scale = native * cfg.record_quality.scale();
         let area = target.area;
         let (w, h) = (area.w.min(display.2), area.h.min(display.3));
         let origin = clamp_origin((area.x, area.y), (w, h), display);
@@ -274,7 +271,7 @@ impl Recording {
 
         let settings = StreamSettings {
             pixels: (pixels(w, scale), pixels(h, scale)),
-            fps: cfg.record_fps,
+            fps: cfg.record_quality.fps(cfg.record_fps),
             mic,
         };
         let config = settings.configuration(source_rect(origin, (w, h), display));

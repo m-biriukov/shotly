@@ -1,9 +1,13 @@
 //! Toolbar next to the selection: layout, hit-testing and drawing.
 //! Icons are drawn as vector paths, so no image assets or fonts are needed.
 
+mod record;
+
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
 
-use crate::config::Preset;
+use crate::config::{
+    FRAME_RATES, HighlightSize, Preset, Quality, RecordChoice, RecordOptions, Switch,
+};
 use crate::geom::{Point, Rect, Scale};
 use crate::paint::{paint, round_stroke};
 use crate::shape::Kind;
@@ -20,6 +24,18 @@ pub enum Group {
     Color,
     /// S/M/L plus the text-box toggle.
     Size,
+    /// Recording: frames per second.
+    Fps,
+    /// Recording: video quality.
+    Quality,
+    /// Recording: colour of the pointer highlight.
+    PointerColor,
+    /// Recording: size of the pointer highlight.
+    PointerSize,
+    /// Recording: ripple colour of left clicks.
+    LeftColor,
+    /// Recording: ripple colour of right clicks.
+    RightColor,
 }
 
 impl Group {
@@ -35,6 +51,18 @@ impl Group {
                 .map(|&w| Item::Width(w))
                 .chain([Item::TextBg])
                 .collect(),
+            Self::Fps => FRAME_RATES
+                .map(|f| Item::Set(RecordChoice::Fps(f)))
+                .to_vec(),
+            Self::Quality => Quality::ALL
+                .map(|q| Item::Set(RecordChoice::Quality(q)))
+                .to_vec(),
+            Self::PointerSize => HighlightSize::ALL
+                .map(|s| Item::Set(RecordChoice::HighlightSize(s)))
+                .to_vec(),
+            Self::PointerColor => swatches(RecordChoice::HighlightColor),
+            Self::LeftColor => swatches(RecordChoice::LeftColor),
+            Self::RightColor => swatches(RecordChoice::RightColor),
         }
     }
 
@@ -46,6 +74,11 @@ impl Group {
             _ => None,
         }
     }
+}
+
+/// One colour button per palette entry, each making `choice` of its index.
+fn swatches(choice: fn(usize) -> RecordChoice) -> Vec<Item> {
+    (0..PALETTE.len()).map(|i| Item::Set(choice(i))).collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,14 +98,21 @@ pub enum Item {
     Close,
     /// Full screen / Window / Custom, in the strip at the top.
     Preset(Preset),
+    /// A recording setting (record mode).
+    Set(RecordChoice),
 }
 
 /// Text on a preset button; `None` for buttons drawn as icons.
 fn label_of(item: Item) -> Option<String> {
-    match item {
-        Item::Preset(p) => Some(p.name().into()),
-        _ => None,
-    }
+    Some(match item {
+        Item::Preset(p) => p.name().into(),
+        Item::Set(RecordChoice::Fps(f)) => format!("{f} fps"),
+        // The tooltip says what each quality means.
+        Item::Set(RecordChoice::Quality(Quality::High)) => "High".into(),
+        Item::Set(RecordChoice::Quality(Quality::Medium)) => "Medium".into(),
+        Item::Set(RecordChoice::Quality(Quality::Low)) => "Low".into(),
+        _ => return None,
+    })
 }
 
 /// What the toolbar should highlight.
@@ -91,6 +131,8 @@ pub struct State {
     pub can_undo: bool,
     pub can_redo: bool,
     pub hover: Option<Item>,
+    /// The recording settings, when picking an area to record.
+    pub record: Option<RecordOptions>,
 }
 
 pub struct Toolbar {
@@ -108,7 +150,24 @@ const FLYOUT_GAP_PT: f64 = 4.0;
 
 fn groups(record: bool) -> Vec<Vec<Item>> {
     if record {
-        return vec![vec![Item::Record, Item::Close]];
+        let toggle = |s| Item::Set(RecordChoice::Toggle(s));
+        return vec![
+            vec![Item::Group(Group::Fps), Item::Group(Group::Quality)],
+            [Switch::Mic, Switch::Countdown, Switch::Outline]
+                .map(toggle)
+                .to_vec(),
+            vec![
+                toggle(Switch::Pointer),
+                Item::Group(Group::PointerColor),
+                Item::Group(Group::PointerSize),
+            ],
+            vec![
+                toggle(Switch::Clicks),
+                Item::Group(Group::LeftColor),
+                Item::Group(Group::RightColor),
+            ],
+            vec![Item::Record, Item::Close],
+        ];
     }
     vec![
         vec![
@@ -119,6 +178,7 @@ fn groups(record: bool) -> Vec<Vec<Item>> {
             Item::Tool(Tool::Text),
             Item::Tool(Tool::Blur),
         ],
+        vec![Item::Tool(Tool::TextSelect), Item::Tool(Tool::TextMark)],
         vec![Item::Group(Group::Color), Item::Group(Group::Size)],
         vec![Item::Undo, Item::Redo],
         vec![Item::Copy, Item::Save, Item::Close],
@@ -132,6 +192,12 @@ pub fn tooltip(item: Item) -> String {
         Item::Group(Group::Draw) => "Draw (P, H)".into(),
         Item::Group(Group::Color) => "Color".into(),
         Item::Group(Group::Size) => "Size and text background".into(),
+        Item::Group(Group::Fps) => "Frame rate".into(),
+        Item::Group(Group::Quality) => "Video quality".into(),
+        Item::Group(Group::PointerColor) => "Highlight color".into(),
+        Item::Group(Group::PointerSize) => "Highlight size".into(),
+        Item::Group(Group::LeftColor) => "Left click color".into(),
+        Item::Group(Group::RightColor) => "Right click color".into(),
         Item::Tool(t) => format!("{} ({})", t.name(), t.key()),
         Item::Color(i) => COLOR_NAMES[i].into(),
         Item::Width(Width::S) => "Small".into(),
@@ -154,6 +220,7 @@ pub fn tooltip(item: Item) -> String {
             )
         }
         Item::Close => "Cancel (Esc)".into(),
+        Item::Set(choice) => record::tooltip(choice),
     }
 }
 
@@ -213,15 +280,20 @@ pub fn flyout(tb: &Toolbar, group: Group, bounds: Rect, scale: Scale) -> Option<
     );
     let button = tb.items.iter().find(|(i, _)| *i == Item::Group(group))?.1;
     let items = group.items();
-    let w = 2 * pad + items.len() as i32 * cell;
     let h = cell + 2 * pad;
-    let x = button.centered_x(w, &bounds, margin);
     let below = tb.rect.bottom() + gap;
     let y = if below + h <= bounds.bottom() - margin {
         below
     } else {
         tb.rect.y - gap - h
     };
+    // Choices with names need buttons as wide as their text.
+    if items.iter().any(|&i| label_of(i).is_some()) {
+        let centre = button.x + button.w / 2;
+        return Some(text_bar(&items, y, centre, bounds, scale));
+    }
+    let w = 2 * pad + items.len() as i32 * cell;
+    let x = button.centered_x(w, &bounds, margin);
     Some(row(vec![items], x, y, cell, pad, 0))
 }
 
@@ -327,6 +399,8 @@ impl Toolbar {
                 Item::Tool(t) => t == st.tool,
                 Item::Width(w) => w == st.width,
                 Item::TextBg => st.text_bg,
+                // Colours show a ring instead.
+                Item::Set(c) => !record::is_color(c) && st.record.is_some_and(|o| o.has(c)),
                 _ => false,
             };
             if active || st.hover == Some(item) {
@@ -351,14 +425,17 @@ impl Toolbar {
                     &paint(INK, 235),
                     Transform::identity(),
                 );
-                continue;
+            } else {
+                let enabled = match item {
+                    Item::Undo => st.can_undo,
+                    Item::Redo => st.can_redo,
+                    _ => true,
+                };
+                draw_icon(&mut pm, item, (x, y, c), st, s, enabled);
             }
-            let enabled = match item {
-                Item::Undo => st.can_undo,
-                Item::Redo => st.can_redo,
-                _ => true,
-            };
-            draw_icon(&mut pm, item, (x, y, c), st, s, enabled);
+            if st.record.is_some_and(|o| record::faded(item, &o)) {
+                record::fade(&mut pm, (x, y, c, ch));
+            }
         }
         pm
     }
@@ -385,6 +462,11 @@ fn draw_icon(
                 Group::Draw => draw_icon(ic.pm, Item::Tool(st.draw_tool), cell, st, s, enabled),
                 Group::Size => draw_icon(ic.pm, Item::Width(st.width), cell, st, s, enabled),
                 Group::Color => ic.swatch(PALETTE[st.color], 0.26, false),
+                _ => {
+                    if let Some(options) = &st.record {
+                        ic.record_group(g, options);
+                    }
+                }
             }
             ic.chevron();
         }
@@ -399,6 +481,8 @@ fn draw_icon(
         Item::Tool(Tool::Highlighter) => ic.highlighter(),
         Item::Tool(Tool::Text) => ic.letter_t(|u, v| (u, v), None),
         Item::Tool(Tool::Blur) => ic.mosaic(enabled),
+        Item::Tool(Tool::TextSelect) => ic.text_select(),
+        Item::Tool(Tool::TextMark) => ic.text_mark(),
         Item::Color(i) => ic.swatch(PALETTE[i], 0.24, i == st.color),
         Item::Width(w) => ic.width_line(w),
         Item::TextBg => ic.text_bg(),
@@ -406,14 +490,21 @@ fn draw_icon(
         Item::Redo => ic.curved_arrow(true),
         Item::Copy => ic.copy(),
         Item::Save => ic.save(),
-        Item::Record => ic.record_dot(),
+        Item::Record => ic.record_dot(0.28),
+        Item::Set(choice) => {
+            if let Some(options) = &st.record {
+                ic.record_choice(choice, options);
+            }
+        }
         // Drawn as text by `Toolbar::draw`.
         Item::Preset(_) => {}
-        Item::Close => {
-            ic.stroke(&[(0.1, 0.1), (0.9, 0.9)], false);
-            ic.stroke(&[(0.9, 0.1), (0.1, 0.9)], false);
-        }
+        Item::Close => draw_close(&mut ic),
     }
+}
+
+fn draw_close(ic: &mut Icon) {
+    ic.stroke(&[(0.1, 0.1), (0.9, 0.9)], false);
+    ic.stroke(&[(0.9, 0.1), (0.1, 0.9)], false);
 }
 
 /// Paints one toolbar icon. Shapes are given in a unit box (0..1 on both
@@ -662,10 +753,35 @@ impl<'a> Icon<'a> {
         self.stroke(&[(0.0, 0.7), (0.0, 1.0), (1.0, 1.0), (1.0, 0.7)], false);
     }
 
-    /// Red dot: start recording.
-    fn record_dot(&mut self) {
+    /// Lines of text with an I-beam through them.
+    fn text_select(&mut self) {
+        for (v, end) in [(0.18, 0.5), (0.5, 0.42), (0.82, 0.5)] {
+            self.stroke(&[(0.0, v), (end, v)], false);
+        }
+        self.stroke(&[(0.82, 0.05), (0.82, 0.95)], false);
+        self.stroke(&[(0.66, 0.05), (0.98, 0.05)], false);
+        self.stroke(&[(0.66, 0.95), (0.98, 0.95)], false);
+    }
+
+    /// A line of text under a filled highlight bar.
+    fn text_mark(&mut self) {
+        let (bx, by, bs) = self.unit;
+        let mut tint = self.ink.clone();
+        tint.set_color_rgba8(0xFF, 0xCC, 0x00, 190);
+        if let Some(r) =
+            tiny_skia::Rect::from_xywh(bx - 0.05 * bs, by + 0.3 * bs, 1.1 * bs, 0.4 * bs)
+        {
+            self.pm.fill_rect(r, &tint, Transform::identity(), None);
+        }
+        for v in [0.1, 0.5, 0.9] {
+            self.stroke(&[(0.05, v), (0.95, v)], false);
+        }
+    }
+
+    /// Red dot (`radius` as a share of the cell): start recording.
+    fn record_dot(&mut self, radius: f32) {
         let (x, y, c) = self.cell;
-        if let Some(dot) = PathBuilder::from_circle(x + c / 2.0, y + c / 2.0, c * 0.28) {
+        if let Some(dot) = PathBuilder::from_circle(x + c / 2.0, y + c / 2.0, c * radius) {
             self.pm.fill_path(
                 &dot,
                 &paint(0xFF3B30, 255),
@@ -722,15 +838,7 @@ mod tests {
         assert_eq!(tb.hit(Point::new(r.x + 5, r.y + 5)), Some(item));
         assert_eq!(tb.hit(Point::new(tb.rect.x + 1, tb.rect.y + 1)), None);
         assert_eq!(tb.items.last().unwrap().0, Item::Close);
-        assert_eq!(tb.items.len(), 13);
-    }
-
-    #[test]
-    fn record_mode_toolbar_has_only_record_and_close() {
-        let tb = layout(Rect::new(1000, 500, 800, 400), SCREEN, Scale(2.0), true);
-        let items: Vec<Item> = tb.items.iter().map(|&(i, _)| i).collect();
-        assert_eq!(items, vec![Item::Record, Item::Close]);
-        assert!(tooltip(Item::Record).contains("recording"));
+        assert_eq!(tb.items.len(), 15);
     }
 
     #[test]

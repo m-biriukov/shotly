@@ -13,6 +13,7 @@ mod keys;
 mod layers;
 mod login;
 mod macos;
+mod ocr;
 mod output;
 mod overlay;
 mod paint;
@@ -33,6 +34,12 @@ use winit::event_loop::EventLoop;
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 
 fn main() -> Result<()> {
+    // Dev aid (only with `--features dev-hooks`): SHOTLY_TEST_OCR=1 captures
+    // the screens, times text recognition and exits. No windows, no shortcuts.
+    #[cfg(feature = "dev-hooks")]
+    if std::env::var_os("SHOTLY_TEST_OCR").is_some() {
+        return ocr::time_screens();
+    }
     let oneshot = std::env::args().skip(1).any(|a| a == "--capture");
     log_to_file_unless_terminal();
     migrate_from_screenshoot(oneshot);

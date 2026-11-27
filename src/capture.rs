@@ -299,7 +299,12 @@ pub fn warm_up() {
     }
     std::thread::spawn(|| {
         let main = CGMainDisplayID();
-        let _ = with_content(&[main], |c| finish_capture(&start_capture(c, main)?));
+        let image = with_content(&[main], |c| finish_capture(&start_capture(c, main)?));
+        // Outside `with_content`: loading the text recognizer can take a
+        // minute, and captures must not wait for its lock.
+        if let Ok(image) = image {
+            crate::ocr::warm_up(&image);
+        }
     });
 }
 
@@ -377,14 +382,21 @@ pub fn begin() -> Result<Capture> {
     Ok(Capture { displays })
 }
 
+/// Runs `f` with the image on a thread of its own.
+pub fn on_thread<T: Send + 'static>(
+    cg: &CFRetained<CGImage>,
+    f: impl FnOnce(&CGImage) -> T + Send + 'static,
+) -> JoinHandle<T> {
+    let cg = SendBox(cg.clone());
+    std::thread::spawn(move || f(&cg.into_inner()))
+}
+
 /// Reads the image bytes (a 24 MB copy on a Retina display) and converts
 /// them to RGBA on another thread.
 fn start_conversion(cg: &CFRetained<CGImage>) -> JoinHandle<RgbaImage> {
-    let cg = SendBox(cg.clone());
-    std::thread::spawn(move || convert(&cg.into_inner()))
+    on_thread(cg, convert)
 }
 
-/// Never panics: an unreadable image comes out black.
 fn convert(cg: &CGImage) -> RgbaImage {
     let w = CGImage::width(Some(cg));
     let h = CGImage::height(Some(cg));

@@ -48,6 +48,16 @@ objc2-av-foundation = { version = "0.3", default-features = false, features = [
     "AVMediaFormat",
 ] }
 objc2-core-media = "0.3"
+objc2-vision = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "VNObservation",
+    "VNRecognizeTextRequest",
+    "VNRequest",
+    "VNRequestHandler",
+    "VNTypes",
+] }
 raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
 skrifa = "0.49.0"
