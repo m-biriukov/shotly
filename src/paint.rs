@@ -424,6 +424,8 @@ pub fn rounded_rect(r: tiny_skia::Rect, rad: f32) -> tiny_skia::Path {
 
 /// Replaces every `block`-sized cell of `r` with its average colour.
 /// `ts` must be a scale + translate (no rotation), as used everywhere here.
+/// Works one band of cells at a time, reading and writing rows in order:
+/// this runs on every mouse move while a blur box is dragged.
 fn pixelate(pm: &mut PixmapMut, r: Rect, block: f32, ts: Transform) {
     let (pw, ph) = (pm.width() as i32, pm.height() as i32);
     let x0 = (r.x as f32 * ts.sx + ts.tx).round() as i32;
@@ -431,35 +433,59 @@ fn pixelate(pm: &mut PixmapMut, r: Rect, block: f32, ts: Transform) {
     let x1 = (r.right() as f32 * ts.sx + ts.tx).round() as i32;
     let y1 = (r.bottom() as f32 * ts.sy + ts.ty).round() as i32;
     let bs = ((block * ts.sx).round() as i32).max(2);
+    // Cells lie on a grid starting at the box's corner, clipped to the picture.
+    let clip = |from: i32, to: i32, size: i32| -> Vec<(usize, usize)> {
+        (from..to)
+            .step_by(bs as usize)
+            .filter_map(|a| {
+                let (lo, hi) = (a.max(0), (a + bs).min(to).min(size));
+                (lo < hi).then_some((lo as usize, hi as usize))
+            })
+            .collect()
+    };
+    let (cols, rows) = (clip(x0, x1, pw), clip(y0, y1, ph));
+    let stride = pw as usize * 4;
     let data = pm.data_mut();
-    let mut by = y0;
-    while by < y1 {
-        let mut bx = x0;
-        while bx < x1 {
-            let cell = Rect::new(bx, by, bs.min(x1 - bx), bs.min(y1 - by))
-                .intersect(&Rect::new(0, 0, pw, ph));
-            if !cell.is_empty() {
-                let mut sum = [0u32; 4];
-                for y in cell.y..cell.bottom() {
-                    for x in cell.x..cell.right() {
-                        let i = ((y * pw + x) * 4) as usize;
-                        for c in 0..4 {
-                            sum[c] += data[i + c] as u32;
-                        }
-                    }
-                }
-                let n = (cell.w * cell.h) as u32;
-                let avg = sum.map(|v| (v / n) as u8);
-                for y in cell.y..cell.bottom() {
-                    let i = ((y * pw + cell.x) * 4) as usize;
-                    for px in data[i..i + cell.w as usize * 4].as_chunks_mut::<4>().0 {
-                        px.copy_from_slice(&avg);
-                    }
-                }
+    let mut sums = vec![[0u32; 4]; cols.len()];
+    let mut avgs = vec![[0u8; 4]; cols.len()];
+    for &(top, bottom) in &rows {
+        sums.fill([0; 4]);
+        for y in top..bottom {
+            let line = &data[y * stride..(y + 1) * stride];
+            for (sum, &(a, b)) in sums.iter_mut().zip(&cols) {
+                add_pixels(sum, &line[a * 4..b * 4]);
             }
-            bx += bs;
         }
-        by += bs;
+        for ((avg, sum), &(a, b)) in avgs.iter_mut().zip(&sums).zip(&cols) {
+            let n = ((bottom - top) * (b - a)) as u32;
+            *avg = sum.map(|v| (v / n) as u8);
+        }
+        for y in top..bottom {
+            let line = &mut data[y * stride..(y + 1) * stride];
+            for (avg, &(a, b)) in avgs.iter().zip(&cols) {
+                line[a * 4..b * 4].as_chunks_mut::<4>().0.fill(*avg);
+            }
+        }
+    }
+}
+
+/// Adds the channels of the RGBA pixels in `bytes` to `sum`. Four pixels
+/// at a time, which the compiler turns into vector instructions.
+fn add_pixels(sum: &mut [u32; 4], bytes: &[u8]) {
+    let (quads, rest) = bytes.as_chunks::<16>();
+    let mut lanes = [0u32; 16];
+    for q in quads {
+        for (lane, &b) in lanes.iter_mut().zip(q) {
+            *lane += u32::from(b);
+        }
+    }
+    for (i, lane) in lanes.into_iter().enumerate() {
+        sum[i % 4] += lane;
+    }
+    for px in rest.as_chunks::<4>().0 {
+        for (s, &b) in sum.iter_mut().zip(px) {
+            *s += u32::from(b);
+        }
     }
 }
 
@@ -668,6 +694,47 @@ mod tests {
         draw_shape(&mut pm.as_mut(), &s, Transform::identity());
         assert_eq!(pm.pixel(1, 1).unwrap().red(), 127);
         assert_eq!(pm.pixel(10, 10).unwrap().red(), 255);
+    }
+
+    #[test]
+    fn pixelate_matches_a_plain_average_per_cell_even_when_clipped() {
+        let (w, h) = (37, 29);
+        let mut pm = Pixmap::new(w, h).unwrap();
+        for (i, b) in pm.data_mut().iter_mut().enumerate() {
+            *b = (i * 7919 % 251) as u8;
+        }
+        let before = pm.data().to_vec();
+        // Starts off the picture and runs past its right edge.
+        let r = Rect::new(-3, 4, 50, 20);
+        let (bs, ts) = (6, Transform::identity());
+        pixelate(&mut pm.as_mut(), r, bs as f32, ts);
+        let at = |x: i32, y: i32| ((y * w as i32 + x) * 4) as usize;
+        for cy in (r.y..r.bottom()).step_by(bs) {
+            for cx in (r.x..r.right()).step_by(bs) {
+                let xs = cx.max(0)..(cx + bs as i32).min(w as i32);
+                let ys = cy.max(0)..(cy + bs as i32).min(r.bottom()).min(h as i32);
+                let pixels: Vec<(i32, i32)> = ys
+                    .clone()
+                    .flat_map(|y| xs.clone().map(move |x| (x, y)))
+                    .collect();
+                if pixels.is_empty() {
+                    continue;
+                }
+                for c in 0..4 {
+                    let sum: u32 = pixels
+                        .iter()
+                        .map(|&(x, y)| u32::from(before[at(x, y) + c]))
+                        .sum();
+                    let avg = (sum / pixels.len() as u32) as u8;
+                    for &(x, y) in &pixels {
+                        assert_eq!(pm.data()[at(x, y) + c], avg, "cell at {cx},{cy}");
+                    }
+                }
+            }
+        }
+        // Rows outside the box are untouched.
+        assert_eq!(pm.data()[..at(0, 4)], before[..at(0, 4)]);
+        assert_eq!(pm.data()[at(0, 24)..], before[at(0, 24)..]);
     }
 
     #[test]

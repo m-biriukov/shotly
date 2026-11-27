@@ -12,7 +12,7 @@
 
 use std::cell::{OnceCell, RefCell};
 use std::ptr::NonNull;
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -47,7 +47,7 @@ pub struct Shot {
     pub size_pt: (u32, u32),
     /// The captured image, in the display's colour space.
     pub cg: CFRetained<CGImage>,
-    pixels: OnceCell<RgbaImage>,
+    pixels: OnceCell<Arc<RgbaImage>>,
     converting: RefCell<Option<JoinHandle<RgbaImage>>>,
 }
 
@@ -55,13 +55,22 @@ impl Shot {
     /// Native-resolution RGBA pixels (waits for the background conversion
     /// the first time, which has normally finished by then).
     pub fn image(&self) -> &RgbaImage {
+        self.shared()
+    }
+
+    /// The same pixels, for a holder that shares them instead of copying.
+    pub fn shared_image(&self) -> Arc<RgbaImage> {
+        Arc::clone(self.shared())
+    }
+
+    fn shared(&self) -> &Arc<RgbaImage> {
         self.pixels.get_or_init(|| {
             let job = self
                 .converting
                 .borrow_mut()
                 .take()
                 .expect("conversion started");
-            job.join().expect("pixel conversion thread panicked")
+            Arc::new(job.join().expect("pixel conversion thread panicked"))
         })
     }
 }
@@ -391,7 +400,7 @@ pub fn on_thread<T: Send + 'static>(
     std::thread::spawn(move || f(&cg.into_inner()))
 }
 
-/// Reads the image bytes (a 24 MB copy on a Retina display) and converts
+/// Reads the image bytes (24 MB on a Retina display) and converts
 /// them to RGBA on another thread.
 fn start_conversion(cg: &CFRetained<CGImage>) -> JoinHandle<RgbaImage> {
     on_thread(cg, convert)
@@ -410,13 +419,15 @@ fn convert(cg: &CGImage) -> RgbaImage {
                 | CGImageAlphaInfo::PremultipliedFirst
                 | CGImageAlphaInfo::First
         );
-    let bytes = (CGImage::bits_per_pixel(Some(cg)) == 32)
+    // A copy of the pixels that only we hold (`CGDataProviderCopyData`).
+    let data = (CGImage::bits_per_pixel(Some(cg)) == 32)
         .then(|| CGImage::data_provider(Some(cg)))
         .flatten()
-        .and_then(|p| CGDataProvider::data(Some(&p)))
-        .map(|d| d.to_vec());
-    match bytes {
-        Some(bytes) => to_rgba(&bytes, w, h, row, bgra),
+        .and_then(|p| CGDataProvider::data(Some(&p)));
+    match data {
+        // SAFETY: nothing else holds this copy, so it cannot change while
+        // the slice is read.
+        Some(data) => to_rgba(unsafe { data.as_bytes_unchecked() }, w, h, row, bgra),
         None => {
             eprintln!("warning: could not read the captured pixels");
             to_rgba(&[], w, h, row, bgra)

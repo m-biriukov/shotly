@@ -23,7 +23,7 @@ pub(super) fn run(session: &mut Session) {
             f(&mut w.editor, k);
             if w.backdrop.is_none() {
                 let (a, b) = w.size();
-                w.backdrop = Some(Backdrop::new(shots[w.shot].image(), a, b));
+                w.backdrop = Some(Backdrop::new(shots[w.shot].shared_image(), a, b));
             }
             w.layers.sync(&w.editor, w.backdrop.as_ref(), false);
         }

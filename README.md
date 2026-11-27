@@ -320,9 +320,13 @@ access. The pointer halo and click ripples work without any extra permission;
 the app does not watch the keyboard.
 
 - Text recognition happens on your Mac; the picture is not sent anywhere.
+  At launch the app captures the main display once, in memory only, to load
+  the recognizer ahead of time; that picture is thrown away.
 - Screenshots are kept in memory until you copy or save them, and are never
   sent anywhere. Videos are written straight to the save folder. The app makes no network connections.
-- Saved files are readable only by you (mode `600`).
+- Everything the app writes is readable only by you (mode `600`):
+  screenshots, videos (also while they are being recorded), settings and
+  the log.
 - Anything you copy sits on the clipboard like any other copied image, so
   other apps (and Universal Clipboard) can read it.
 - Pixelate uses coarse blocks so that text underneath is hard to recover, but
@@ -391,7 +395,7 @@ CI runs all four on every push.
 | Editing logic, no windowing (unit tested), presets | `editor.rs`, `editor/` (incl. `presets.rs`), `shape.rs`, `geom.rs`, `keys.rs` |
 | Drawing: shapes, text, export | `paint.rs`, `text.rs`, `output.rs` |
 | Overlay display (Core Animation layers) | `layers.rs`, `render.rs`, `toolbar.rs`, `toolbar/record.rs` |
-| Settings and config | `settings.rs`, `config.rs` |
+| Settings and config, local time for file names | `settings.rs`, `config.rs`, `clock.rs` |
 | Look | `style.rs`, `theme.rs` |
 
 Drawing uses [tiny-skia](https://github.com/RazrFalcon/tiny-skia) for both the

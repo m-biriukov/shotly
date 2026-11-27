@@ -1,6 +1,8 @@
 //! CPU rasterising for the overlay's layers: only the parts that change are
 //! painted here; the frozen screen itself is a GPU layer (see `layers.rs`).
 
+use std::sync::Arc;
+
 use image::RgbaImage;
 use tiny_skia::{IntSize, Pixmap, Transform};
 
@@ -14,15 +16,17 @@ use crate::theme;
 pub struct Backdrop {
     pub w: u32,
     pub h: u32,
-    rgba: Vec<u8>,
+    /// Shared with the capture when the sizes match (the usual case), so the
+    /// screen is not held twice.
+    rgba: Arc<RgbaImage>,
 }
 
 impl Backdrop {
     /// Resamples `img` (nearest neighbour) to `w`×`h` if sizes differ.
-    pub fn new(img: &RgbaImage, w: u32, h: u32) -> Self {
+    pub fn new(img: Arc<RgbaImage>, w: u32, h: u32) -> Self {
         let (iw, ih) = img.dimensions();
         let rgba = if (iw, ih) == (w, h) {
-            img.as_raw().clone()
+            img
         } else {
             let raw = img.as_raw();
             let mut v = Vec::with_capacity((w * h * 4) as usize);
@@ -34,9 +38,13 @@ impl Backdrop {
                     v.extend_from_slice(&raw[i..i + 4]);
                 }
             }
-            v
+            Arc::new(RgbaImage::from_raw(w, h, v).expect("w × h pixels"))
         };
         Self { w, h, rgba }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.rgba.as_raw()
     }
 
     fn bounds(&self) -> Rect {
@@ -49,7 +57,7 @@ impl Backdrop {
         let mut data = Vec::with_capacity(row * r.h as usize);
         for y in r.y..r.bottom() {
             let s = (y as usize * self.w as usize + r.x as usize) * 4;
-            data.extend_from_slice(&self.rgba[s..s + row]);
+            data.extend_from_slice(&self.bytes()[s..s + row]);
         }
         Pixmap::from_vec(data, IntSize::from_wh(r.w as u32, r.h as u32).unwrap()).unwrap()
     }
@@ -108,7 +116,7 @@ pub fn active(bd: &Backdrop, s: &Shape) -> Option<(Rect, Pixmap, Option<Ink>)> {
         Pixmap::new(r.w as u32, r.h as u32)?
     };
     let ink = matches!(s.kind, Kind::Highlighter | Kind::TextMark)
-        .then(|| Ink::over(&bd.rgba, bd.w, bd.h, paint::ink_area(s)));
+        .then(|| Ink::over(bd.bytes(), bd.w, bd.h, paint::ink_area(s)));
     paint::draw_inked(&mut pm.as_mut(), s, ts, ink.unwrap_or(Ink::Darken));
     Some((r, pm, ink))
 }
@@ -220,7 +228,7 @@ mod tests {
 
     fn backdrop() -> Backdrop {
         Backdrop::new(
-            &RgbaImage::from_pixel(400, 300, Rgba([200, 100, 50, 255])),
+            Arc::new(RgbaImage::from_pixel(400, 300, Rgba([200, 100, 50, 255]))),
             400,
             300,
         )
@@ -271,7 +279,7 @@ mod tests {
         let marker = line((50, 100), (200, 100), Kind::Highlighter);
         for (shade, expected) in [(255, Ink::Darken), (0, Ink::Lighten)] {
             let img = RgbaImage::from_pixel(400, 300, Rgba([shade, shade, shade, 255]));
-            let (_, _, ink) = active(&Backdrop::new(&img, 400, 300), &marker).unwrap();
+            let (_, _, ink) = active(&Backdrop::new(Arc::new(img), 400, 300), &marker).unwrap();
             assert_eq!(ink, Some(expected));
         }
         let bd = backdrop();
@@ -284,8 +292,12 @@ mod tests {
     fn resamples_when_window_size_differs() {
         let mut img = RgbaImage::from_pixel(200, 160, Rgba([0, 0, 0, 255]));
         img.put_pixel(199, 159, Rgba([255, 255, 255, 255]));
-        let bd = Backdrop::new(&img, 100, 80);
-        assert_eq!((bd.w, bd.h, bd.rgba.len()), (100, 80, 100 * 80 * 4));
+        let bd = Backdrop::new(Arc::new(img), 100, 80);
+        assert_eq!((bd.w, bd.h, bd.bytes().len()), (100, 80, 100 * 80 * 4));
+        // The same size: shared, not copied.
+        let img = Arc::new(RgbaImage::new(100, 80));
+        let bd = Backdrop::new(Arc::clone(&img), 100, 80);
+        assert!(Arc::ptr_eq(&img, &bd.rgba));
     }
 
     #[test]

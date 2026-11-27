@@ -302,7 +302,7 @@ impl Session {
             let needs_pixels = ed.active_shape().is_some() || ed.static_shapes().next().is_some();
             if needs_pixels && w.backdrop.is_none() {
                 let (bw, bh) = w.size();
-                w.backdrop = Some(Backdrop::new(self.shots[w.shot].image(), bw, bh));
+                w.backdrop = Some(Backdrop::new(self.shots[w.shot].shared_image(), bw, bh));
             }
             w.layers.sync(&w.editor, w.backdrop.as_ref(), w.tip.shown);
         }
@@ -459,7 +459,7 @@ impl Session {
                 Err(e) => Outcome::Failed(format!("{e:#}")),
             }
         } else {
-            let name = self.cfg.file_name(chrono::Local::now());
+            let name = self.cfg.file_name(crate::clock::Stamp::now());
             match output::save(&img, &self.cfg.save_dir(), &name, self.cfg.format) {
                 Ok(p) => Outcome::Saved(p),
                 Err(e) => Outcome::Failed(format!("{e:#}")),

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::clock::Stamp;
 use crate::style::{PALETTE, Width};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -572,24 +573,24 @@ impl Config {
     }
 
     /// File name for a capture taken at `now`, with extension.
-    pub fn file_name(&self, now: chrono::DateTime<chrono::Local>) -> String {
+    pub fn file_name(&self, now: Stamp) -> String {
         format!("{}.{}", self.file_stem(now), self.format.ext())
     }
 
     /// File name for a screen recording started at `now`.
-    pub fn video_name(&self, now: chrono::DateTime<chrono::Local>) -> String {
+    pub fn video_name(&self, now: Stamp) -> String {
         format!("{}.mp4", self.file_stem(now))
     }
 
-    fn file_stem(&self, now: chrono::DateTime<chrono::Local>) -> String {
+    fn file_stem(&self, now: Stamp) -> String {
         let pattern = if self.filename.trim().is_empty() {
             "Screenshot {date} at {time}"
         } else {
             &self.filename
         };
         pattern
-            .replace("{date}", &now.format("%Y-%m-%d").to_string())
-            .replace("{time}", &now.format("%H.%M.%S").to_string())
+            .replace("{date}", &now.date())
+            .replace("{time}", &now.time_with_dots())
             .replace(['/', ':'], "-")
     }
 }
@@ -647,7 +648,6 @@ fn expand_tilde(p: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     #[test]
     fn round_trips_through_toml() {
@@ -791,9 +791,14 @@ mod tests {
 
     #[test]
     fn recording_file_name_is_mp4() {
-        let now = chrono::Local
-            .with_ymd_and_hms(2026, 11, 10, 9, 5, 7)
-            .unwrap();
+        let now = Stamp {
+            year: 2026,
+            month: 11,
+            day: 10,
+            hour: 9,
+            minute: 5,
+            second: 7,
+        };
         assert_eq!(
             Config::default().video_name(now),
             "Screenshot 2026-11-10 at 09.05.07.mp4"
@@ -820,9 +825,14 @@ mod tests {
 
     #[test]
     fn file_name_fills_pattern() {
-        let now = chrono::Local
-            .with_ymd_and_hms(2026, 11, 10, 9, 5, 7)
-            .unwrap();
+        let now = Stamp {
+            year: 2026,
+            month: 11,
+            day: 10,
+            hour: 9,
+            minute: 5,
+            second: 7,
+        };
         let mut c = Config::default();
         assert_eq!(c.file_name(now), "Screenshot 2026-11-10 at 09.05.07.png");
         c.filename = "shot/{time}".into();
