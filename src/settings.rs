@@ -23,7 +23,7 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::app::AppEvent;
 use crate::config::{
-    Config, FRAME_RATES, Format, HighlightSize, ToastCorner, ToastOffset, ToastSize,
+    Config, FRAME_RATES, Format, HighlightSize, Quality, ToastCorner, ToastOffset, ToastSize,
 };
 use crate::login;
 use crate::style::{COLOR_NAMES, Width};
@@ -59,7 +59,7 @@ struct Ivars {
     login: OnceCell<Retained<NSButton>>,
     record_hotkey_button: OnceCell<Retained<NSButton>>,
     fps: OnceCell<Retained<NSPopUpButton>>,
-    resolution: OnceCell<Retained<NSPopUpButton>>,
+    quality: OnceCell<Retained<NSPopUpButton>>,
     mic: OnceCell<Retained<NSButton>>,
     countdown: OnceCell<Retained<NSButton>>,
     outline: OnceCell<Retained<NSButton>>,
@@ -195,7 +195,7 @@ impl ShotlySettings {
         cfg.record_fps = FRAME_RATES[pick(&iv.fps.get(), FRAME_RATES.len())];
         let checked =
             |b: Option<&Retained<NSButton>>| b.is_some_and(|b| b.state() == NSControlStateValueOn);
-        cfg.record_retina = pick(&iv.resolution.get(), 2) == 0;
+        cfg.record_quality = Quality::ALL[pick(&iv.quality.get(), Quality::ALL.len())];
         cfg.record_mic = checked(iv.mic.get());
         cfg.record_countdown = checked(iv.countdown.get());
         cfg.record_outline = checked(iv.outline.get());
@@ -321,7 +321,7 @@ impl Settings {
             login: OnceCell::new(),
             record_hotkey_button: OnceCell::new(),
             fps: OnceCell::new(),
-            resolution: OnceCell::new(),
+            quality: OnceCell::new(),
             mic: OnceCell::new(),
             countdown: OnceCell::new(),
             outline: OnceCell::new(),
@@ -381,7 +381,9 @@ impl Settings {
     }
 }
 
-const W: f64 = 520.0;
+const W: f64 = 560.0;
+/// Width a tab view this wide leaves for a tab's content.
+const PAGE_W: f64 = W - 40.0;
 /// Height of one tab's content, and of the tab strip plus margins around it.
 const PAGE_H: f64 = 480.0;
 const TABS_CHROME: f64 = 44.0;
@@ -392,6 +394,12 @@ const PAD: f64 = 20.0;
 /// Where controls start inside a tab, right of the labels.
 const X: f64 = PAD + LABEL_W + 12.0;
 const ROW_H: f64 = 34.0;
+/// Every control, or control plus its button, is this wide, so their right
+/// edges line up inside the tab.
+const FIELD_W: f64 = PAGE_W - X - 28.0;
+/// A button beside a control, and the space between them.
+const EXTRA_W: f64 = 96.0;
+const EXTRA_GAP: f64 = 8.0;
 
 /// Lays out a tab's rows top to bottom. A label and its control share one
 /// vertical centre, so their text lines up whatever each one's height is.
@@ -405,7 +413,7 @@ impl Page {
     fn new(mtm: MainThreadMarker) -> Self {
         let view = NSView::initWithFrame(
             NSView::alloc(mtm),
-            NSRect::new(NSPoint::ZERO, NSSize::new(W - 2.0 * PAD + 20.0, PAGE_H)),
+            NSRect::new(NSPoint::ZERO, NSSize::new(PAGE_W, PAGE_H)),
         );
         Self {
             view,
@@ -421,9 +429,22 @@ impl Page {
         yc
     }
 
-    /// `label` (may be empty) and its `control`, `w` wide. The text of both
+    /// `label` (may be empty) and its `control`.
+    fn row(&mut self, label: &str, control: &NSView) {
+        self.place_row(label, control, FIELD_W);
+    }
+
+    /// A row whose control shares its width with a button to its right.
+    fn row_with(&mut self, label: &str, control: &NSView, extra: &NSView) {
+        let w = FIELD_W - EXTRA_GAP - EXTRA_W;
+        let yc = self.place_row(label, control, w);
+        place(&self.view, extra, X + w + EXTRA_GAP, yc, EXTRA_W);
+        align_baseline(extra, baseline(control));
+    }
+
+    /// Places a row with a control `w` wide. The text of label and control
     /// sits on one baseline. Returns the row's vertical centre.
-    fn row(&mut self, label: &str, control: &NSView, w: f64) -> f64 {
+    fn place_row(&mut self, label: &str, control: &NSView, w: f64) -> f64 {
         let yc = self.next(ROW_H);
         place(&self.view, control, X, yc, w);
         if !label.is_empty() {
@@ -435,27 +456,12 @@ impl Page {
         yc
     }
 
-    /// A row with a second control `dx` to the right of the first.
-    fn row_with(
-        &mut self,
-        label: &str,
-        control: &NSView,
-        w: f64,
-        extra: &NSView,
-        dx: f64,
-        ew: f64,
-    ) {
-        let yc = self.row(label, control, w);
-        place(&self.view, extra, X + dx, yc, ew);
-        align_baseline(extra, baseline(control));
-    }
-
     /// Small grey note under a row.
     fn hint(&mut self, text: &str) {
         let yc = self.next(20.0);
         let hint = NSTextField::labelWithString(&NSString::from_str(text), self.mtm);
         hint.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-        place(&self.view, &hint, X, yc, 310.0);
+        place(&self.view, &hint, X, yc, FIELD_W);
     }
 
     /// Extra space between groups of rows.
@@ -478,14 +484,14 @@ fn build(ctrl: &Retained<ShotlySettings>, cfg: &Config, mtm: MainThreadMarker) {
         sel!(recordHotkey:),
         mtm,
     );
-    general.row("Capture shortcut:", &hk, 250.0);
+    general.row("Capture shortcut:", &hk);
 
     let folder = NSTextField::textFieldWithString(&NSString::from_str(&cfg.save_dir), mtm);
     let choose = button("Choose…", target, sel!(chooseFolder:), mtm);
-    general.row_with("Save folder:", &folder, 210.0, &choose, 216.0, 96.0);
+    general.row_with("Save folder:", &folder, &choose);
 
     let filename = NSTextField::textFieldWithString(&NSString::from_str(&cfg.filename), mtm);
-    general.row("File name:", &filename, 310.0);
+    general.row("File name:", &filename);
     general.hint("{date} and {time} are filled in");
 
     let format = popup(
@@ -493,26 +499,26 @@ fn build(ctrl: &Retained<ShotlySettings>, cfg: &Config, mtm: MainThreadMarker) {
         usize::from(cfg.format == Format::Jpeg),
         mtm,
     );
-    general.row("Format:", &format, 200.0);
+    general.row("Format:", &format);
 
     let color = popup(&COLOR_NAMES, cfg.color, mtm);
-    general.row("Default color:", &color, 200.0);
+    general.row("Default color:", &color);
 
     let size_idx = Width::ALL
         .iter()
         .position(|&w| w == cfg.width())
         .unwrap_or(1);
     let size = popup(&SIZE_NAMES, size_idx, mtm);
-    general.row("Default size:", &size, 200.0);
+    general.row("Default size:", &size);
 
     general.gap(10.0);
     let login_box = checkbox("Launch at login", login::is_enabled(), mtm);
-    general.row("", &login_box, 310.0);
+    general.row("", &login_box);
 
     // ---- Notice ----
     let mut notice = Page::new(mtm);
     let toast = checkbox("Show notice after copy or save", cfg.toast, mtm);
-    notice.row("", &toast, 310.0);
+    notice.row("", &toast);
 
     let names = ToastCorner::ALL.map(ToastCorner::name);
     let toast_position = popup(
@@ -520,23 +526,16 @@ fn build(ctrl: &Retained<ShotlySettings>, cfg: &Config, mtm: MainThreadMarker) {
         index_of(&ToastCorner::ALL, &cfg.toast_position),
         mtm,
     );
-    notice.row("Position:", &toast_position, 200.0);
+    notice.row("Position:", &toast_position);
 
     let names = ToastSize::ALL.map(ToastSize::name);
     let toast_size = popup(&names, index_of(&ToastSize::ALL, &cfg.toast_size), mtm);
-    notice.row("Size:", &toast_size, 200.0);
+    notice.row("Size:", &toast_size);
 
     let names = ToastOffset::ALL.map(ToastOffset::name);
     let toast_offset = popup(&names, index_of(&ToastOffset::ALL, &cfg.toast_offset), mtm);
     let preview = button("Preview", target, sel!(previewToast:), mtm);
-    notice.row_with(
-        "Distance from edge:",
-        &toast_offset,
-        200.0,
-        &preview,
-        210.0,
-        100.0,
-    );
+    notice.row_with("Distance from edge:", &toast_offset, &preview);
 
     // ---- Recording ----
     let mut rec = Page::new(mtm);
@@ -546,52 +545,49 @@ fn build(ctrl: &Retained<ShotlySettings>, cfg: &Config, mtm: MainThreadMarker) {
         sel!(recordRecordHotkey:),
         mtm,
     );
-    rec.row("Record shortcut:", &rec_hk, 250.0);
+    rec.row("Record shortcut:", &rec_hk);
     rec.hint("Press it again to stop recording");
 
     let fps_names = FRAME_RATES.map(|f| format!("{f} fps"));
     let fps_names: Vec<&str> = fps_names.iter().map(String::as_str).collect();
     let fps = popup(&fps_names, index_of(&FRAME_RATES, &cfg.record_fps), mtm);
-    rec.row("Frame rate:", &fps, 200.0);
+    rec.row("Frame rate:", &fps);
 
-    let resolution = popup(
-        &["Retina (full pixels)", "Standard (points)"],
-        usize::from(!cfg.record_retina),
-        mtm,
-    );
-    rec.row("Resolution:", &resolution, 200.0);
+    let names = Quality::ALL.map(Quality::name);
+    let quality = popup(&names, index_of(&Quality::ALL, &cfg.record_quality), mtm);
+    rec.row("Video quality:", &quality);
 
     let mic = checkbox("Record microphone", cfg.record_mic, mtm);
-    rec.row("", &mic, 310.0);
+    rec.row("", &mic);
     let countdown = checkbox(
         "Count down 3-2-1 before starting",
         cfg.record_countdown,
         mtm,
     );
-    rec.row("", &countdown, 310.0);
+    rec.row("", &countdown);
     let outline = checkbox("Show a frame around the area", cfg.record_outline, mtm);
-    rec.row("", &outline, 310.0);
+    rec.row("", &outline);
 
     rec.gap(10.0);
     let highlight_cursor = checkbox("Highlight the mouse pointer", cfg.highlight_cursor, mtm);
-    rec.row("", &highlight_cursor, 310.0);
+    rec.row("", &highlight_cursor);
     let highlight_color = popup(&COLOR_NAMES, cfg.highlight_color, mtm);
-    rec.row("Highlight color:", &highlight_color, 200.0);
+    rec.row("Highlight color:", &highlight_color);
     let names = HighlightSize::ALL.map(HighlightSize::name);
     let highlight_size = popup(
         &names,
         index_of(&HighlightSize::ALL, &cfg.highlight_size),
         mtm,
     );
-    rec.row("Highlight size:", &highlight_size, 200.0);
+    rec.row("Highlight size:", &highlight_size);
 
     rec.gap(10.0);
     let show_clicks = checkbox("Show mouse clicks", cfg.show_clicks, mtm);
-    rec.row("", &show_clicks, 310.0);
+    rec.row("", &show_clicks);
     let left_color = popup(&COLOR_NAMES, cfg.left_click_color, mtm);
-    rec.row("Left click color:", &left_color, 200.0);
+    rec.row("Left click color:", &left_color);
     let right_color = popup(&COLOR_NAMES, cfg.right_click_color, mtm);
-    rec.row("Right click color:", &right_color, 200.0);
+    rec.row("Right click color:", &right_color);
 
     // ---- Tabs and buttons ----
     let tabs = NSTabView::initWithFrame(
@@ -633,7 +629,7 @@ fn build(ctrl: &Retained<ShotlySettings>, cfg: &Config, mtm: MainThreadMarker) {
     let _ = iv.login.set(login_box);
     let _ = iv.record_hotkey_button.set(rec_hk);
     let _ = iv.fps.set(fps);
-    let _ = iv.resolution.set(resolution);
+    let _ = iv.quality.set(quality);
     let _ = iv.mic.set(mic);
     let _ = iv.countdown.set(countdown);
     let _ = iv.outline.set(outline);

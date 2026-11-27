@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::clock::Stamp;
 use crate::style::{PALETTE, Width};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,8 +189,143 @@ impl HighlightSize {
     }
 }
 
+/// How sharp (and how big) recordings are. All are H.264.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Quality {
+    High,
+    Medium,
+    Low,
+}
+
+impl Quality {
+    pub const ALL: [Self; 3] = [Self::High, Self::Medium, Self::Low];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::High => "High (full resolution)",
+            Self::Medium => "Medium (75%)",
+            Self::Low => "Low (50%, 30 fps)",
+        }
+    }
+
+    /// Video size as a fraction of the display's own pixels.
+    pub fn scale(self) -> f64 {
+        match self {
+            Self::High => 1.0,
+            Self::Medium => 0.75,
+            Self::Low => 0.5,
+        }
+    }
+
+    /// The frame rate to record at when `wanted` is chosen in Settings.
+    pub fn fps(self, wanted: u32) -> u32 {
+        match self {
+            Self::Low => wanted.min(30),
+            Self::High | Self::Medium => wanted,
+        }
+    }
+}
+
 /// Frame rates offered for recordings.
 pub const FRAME_RATES: [u32; 2] = [30, 60];
+
+/// The recording settings, which the picker offers again before a start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordOptions {
+    pub fps: u32,
+    pub quality: Quality,
+    pub mic: bool,
+    pub countdown: bool,
+    pub outline: bool,
+    pub highlight_cursor: bool,
+    pub highlight_color: usize,
+    pub highlight_size: HighlightSize,
+    pub show_clicks: bool,
+    pub left_click_color: usize,
+    pub right_click_color: usize,
+}
+
+/// An on/off recording setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Switch {
+    Mic,
+    Countdown,
+    Outline,
+    Pointer,
+    Clicks,
+}
+
+/// One change to [`RecordOptions`]: a value picked, or a switch flipped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordChoice {
+    Fps(u32),
+    Quality(Quality),
+    Toggle(Switch),
+    HighlightColor(usize),
+    HighlightSize(HighlightSize),
+    LeftColor(usize),
+    RightColor(usize),
+}
+
+impl RecordOptions {
+    pub fn apply(&mut self, choice: RecordChoice) {
+        match choice {
+            RecordChoice::Fps(f) => self.fps = f,
+            RecordChoice::Quality(q) => self.quality = q,
+            RecordChoice::Toggle(s) => {
+                let on = match s {
+                    Switch::Mic => &mut self.mic,
+                    Switch::Countdown => &mut self.countdown,
+                    Switch::Outline => &mut self.outline,
+                    Switch::Pointer => &mut self.highlight_cursor,
+                    Switch::Clicks => &mut self.show_clicks,
+                };
+                *on = !*on;
+            }
+            RecordChoice::HighlightColor(c) => self.highlight_color = c,
+            RecordChoice::HighlightSize(s) => self.highlight_size = s,
+            RecordChoice::LeftColor(c) => self.left_click_color = c,
+            RecordChoice::RightColor(c) => self.right_click_color = c,
+        }
+    }
+
+    pub fn is_on(&self, s: Switch) -> bool {
+        match s {
+            Switch::Mic => self.mic,
+            Switch::Countdown => self.countdown,
+            Switch::Outline => self.outline,
+            Switch::Pointer => self.highlight_cursor,
+            Switch::Clicks => self.show_clicks,
+        }
+    }
+
+    /// Whether `choice` is what is set now.
+    pub fn has(&self, choice: RecordChoice) -> bool {
+        match choice {
+            // The rate that will really be recorded.
+            RecordChoice::Fps(f) => self.quality.fps(self.fps) == f,
+            RecordChoice::Quality(q) => self.quality == q,
+            RecordChoice::Toggle(s) => self.is_on(s),
+            RecordChoice::HighlightColor(c) => self.highlight_color == c,
+            RecordChoice::HighlightSize(s) => self.highlight_size == s,
+            RecordChoice::LeftColor(c) => self.left_click_color == c,
+            RecordChoice::RightColor(c) => self.right_click_color == c,
+        }
+    }
+
+    /// Whether `choice` can have an effect with the other settings as they are.
+    pub fn applies(&self, choice: RecordChoice) -> bool {
+        match choice {
+            RecordChoice::Fps(f) => self.quality.fps(f) == f,
+            RecordChoice::HighlightColor(_) | RecordChoice::HighlightSize(_) => {
+                self.highlight_cursor
+            }
+            RecordChoice::LeftColor(_) | RecordChoice::RightColor(_) => self.show_clicks,
+            RecordChoice::Quality(_) | RecordChoice::Toggle(_) => true,
+        }
+    }
+}
 
 const DEFAULT_SAVE_DIR: &str = "~/Pictures/Screenshots";
 
@@ -218,8 +354,8 @@ pub struct Config {
     pub record_hotkey: String,
     /// 30 or 60.
     pub record_fps: u32,
-    /// Record at the display's full pixel resolution (otherwise points).
-    pub record_retina: bool,
+    /// Resolution (and frame-rate limit) of recordings.
+    pub record_quality: Quality,
     /// Add the microphone to the recording.
     pub record_mic: bool,
     /// Count 3-2-1 before the recording starts.
@@ -254,7 +390,7 @@ impl Default for Config {
             preset: Preset::Custom,
             record_hotkey: "Cmd+Shift+1".into(),
             record_fps: 30,
-            record_retina: true,
+            record_quality: Quality::High,
             record_mic: false,
             record_countdown: true,
             record_outline: true,
@@ -321,6 +457,22 @@ impl Config {
     /// file) is skipped, with a warning, instead of throwing away the rest.
     /// Only a file that is not valid TOML at all fails.
     fn parse_lenient(text: &str) -> Result<Self, toml::de::Error> {
+        Self::parse_values(text).map(|c| c.upgraded_from(text))
+    }
+
+    /// Settings from before `record_quality`: "Standard" resolution
+    /// (`record_retina = false`) is today's Low.
+    fn upgraded_from(mut self, text: &str) -> Self {
+        if let Ok(t) = toml::from_str::<toml::Table>(text)
+            && !t.contains_key("record_quality")
+            && t.get("record_retina") == Some(&toml::Value::Boolean(false))
+        {
+            self.record_quality = Quality::Low;
+        }
+        self
+    }
+
+    fn parse_values(text: &str) -> Result<Self, toml::de::Error> {
         if let Ok(c) = toml::from_str::<Self>(text) {
             return Ok(c);
         }
@@ -381,6 +533,36 @@ impl Config {
         parse_width(&self.width).unwrap_or(Width::M)
     }
 
+    pub fn record_options(&self) -> RecordOptions {
+        RecordOptions {
+            fps: self.record_fps,
+            quality: self.record_quality,
+            mic: self.record_mic,
+            countdown: self.record_countdown,
+            outline: self.record_outline,
+            highlight_cursor: self.highlight_cursor,
+            highlight_color: self.highlight_color,
+            highlight_size: self.highlight_size,
+            show_clicks: self.show_clicks,
+            left_click_color: self.left_click_color,
+            right_click_color: self.right_click_color,
+        }
+    }
+
+    pub fn set_record_options(&mut self, o: RecordOptions) {
+        self.record_fps = o.fps;
+        self.record_quality = o.quality;
+        self.record_mic = o.mic;
+        self.record_countdown = o.countdown;
+        self.record_outline = o.outline;
+        self.highlight_cursor = o.highlight_cursor;
+        self.highlight_color = o.highlight_color;
+        self.highlight_size = o.highlight_size;
+        self.show_clicks = o.show_clicks;
+        self.left_click_color = o.left_click_color;
+        self.right_click_color = o.right_click_color;
+    }
+
     pub fn set_width(&mut self, w: Width) {
         self.width = width_name(w).into();
     }
@@ -391,24 +573,24 @@ impl Config {
     }
 
     /// File name for a capture taken at `now`, with extension.
-    pub fn file_name(&self, now: chrono::DateTime<chrono::Local>) -> String {
+    pub fn file_name(&self, now: Stamp) -> String {
         format!("{}.{}", self.file_stem(now), self.format.ext())
     }
 
     /// File name for a screen recording started at `now`.
-    pub fn video_name(&self, now: chrono::DateTime<chrono::Local>) -> String {
+    pub fn video_name(&self, now: Stamp) -> String {
         format!("{}.mp4", self.file_stem(now))
     }
 
-    fn file_stem(&self, now: chrono::DateTime<chrono::Local>) -> String {
+    fn file_stem(&self, now: Stamp) -> String {
         let pattern = if self.filename.trim().is_empty() {
             "Screenshot {date} at {time}"
         } else {
             &self.filename
         };
         pattern
-            .replace("{date}", &now.format("%Y-%m-%d").to_string())
-            .replace("{time}", &now.format("%H.%M.%S").to_string())
+            .replace("{date}", &now.date())
+            .replace("{time}", &now.time_with_dots())
             .replace(['/', ':'], "-")
     }
 }
@@ -466,7 +648,6 @@ fn expand_tilde(p: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     #[test]
     fn round_trips_through_toml() {
@@ -507,11 +688,57 @@ mod tests {
     }
 
     #[test]
+    fn record_options_round_trip_and_change_one_setting_at_a_time() {
+        let mut cfg = Config::default();
+        let mut o = cfg.record_options();
+        for choice in [
+            RecordChoice::Fps(60),
+            RecordChoice::Quality(Quality::Medium),
+            RecordChoice::Toggle(Switch::Mic),
+            RecordChoice::Toggle(Switch::Countdown),
+            RecordChoice::Toggle(Switch::Outline),
+            RecordChoice::Toggle(Switch::Pointer),
+            RecordChoice::Toggle(Switch::Clicks),
+            RecordChoice::HighlightColor(5),
+            RecordChoice::HighlightSize(HighlightSize::Large),
+            RecordChoice::LeftColor(3),
+            RecordChoice::RightColor(1),
+        ] {
+            let before = o;
+            o.apply(choice);
+            assert_ne!(o, before, "{choice:?}");
+        }
+        assert!(o.mic && !o.countdown && !o.outline);
+        cfg.set_record_options(o);
+        assert_eq!(cfg.record_options(), o);
+        assert_eq!(cfg.record_fps, 60);
+        assert_eq!(cfg.left_click_color, 3);
+    }
+
+    #[test]
+    fn dependent_record_options_say_when_they_do_not_apply() {
+        let mut o = Config::default().record_options();
+        o.fps = 60;
+        assert!(o.has(RecordChoice::Fps(60)) && o.applies(RecordChoice::Fps(60)));
+        o.quality = Quality::Low;
+        // Low records at 30 whatever was chosen, and remembers the choice.
+        assert!(o.has(RecordChoice::Fps(30)) && !o.applies(RecordChoice::Fps(60)));
+        assert_eq!(o.fps, 60);
+        assert!(o.applies(RecordChoice::LeftColor(0)));
+        o.apply(RecordChoice::Toggle(Switch::Clicks));
+        assert!(!o.applies(RecordChoice::LeftColor(0)));
+        assert!(o.applies(RecordChoice::HighlightColor(0)));
+        o.apply(RecordChoice::Toggle(Switch::Pointer));
+        assert!(!o.applies(RecordChoice::HighlightSize(HighlightSize::Small)));
+    }
+
+    #[test]
     fn recording_settings_default_and_are_sanitized() {
         let c: Config = toml::from_str("format = \"jpeg\"").unwrap();
         assert_eq!(c.record_hotkey, "Cmd+Shift+1");
         assert_eq!(c.record_fps, 30);
-        assert!(c.record_retina && c.highlight_cursor && c.show_clicks);
+        assert!(c.highlight_cursor && c.show_clicks);
+        assert_eq!(c.record_quality, Quality::High);
         assert!(!c.record_mic);
         let c: Config = toml::from_str(
             "record_fps = 24\nhighlight_color = 99\nleft_click_color = 8\nhighlight_size = \"large\"",
@@ -541,10 +768,37 @@ mod tests {
     }
 
     #[test]
+    fn quality_sets_size_and_limits_the_frame_rate() {
+        assert!(Quality::High.scale() > Quality::Medium.scale());
+        assert!(Quality::Medium.scale() > Quality::Low.scale());
+        assert_eq!(Quality::High.fps(60), 60);
+        assert_eq!(Quality::Medium.fps(60), 60);
+        assert_eq!(Quality::Low.fps(60), 30);
+        assert_eq!(Quality::Low.fps(30), 30);
+    }
+
+    #[test]
+    fn the_old_resolution_setting_becomes_a_quality() {
+        let load = |t: &str| Config::parse_lenient(t).unwrap().record_quality;
+        assert_eq!(load("record_retina = false"), Quality::Low);
+        assert_eq!(load("record_retina = true"), Quality::High);
+        // The new key wins over the old one.
+        assert_eq!(
+            load("record_retina = false\nrecord_quality = \"medium\""),
+            Quality::Medium
+        );
+    }
+
+    #[test]
     fn recording_file_name_is_mp4() {
-        let now = chrono::Local
-            .with_ymd_and_hms(2026, 11, 10, 9, 5, 7)
-            .unwrap();
+        let now = Stamp {
+            year: 2026,
+            month: 11,
+            day: 10,
+            hour: 9,
+            minute: 5,
+            second: 7,
+        };
         assert_eq!(
             Config::default().video_name(now),
             "Screenshot 2026-11-10 at 09.05.07.mp4"
@@ -571,9 +825,14 @@ mod tests {
 
     #[test]
     fn file_name_fills_pattern() {
-        let now = chrono::Local
-            .with_ymd_and_hms(2026, 11, 10, 9, 5, 7)
-            .unwrap();
+        let now = Stamp {
+            year: 2026,
+            month: 11,
+            day: 10,
+            hour: 9,
+            minute: 5,
+            second: 7,
+        };
         let mut c = Config::default();
         assert_eq!(c.file_name(now), "Screenshot 2026-11-10 at 09.05.07.png");
         c.filename = "shot/{time}".into();

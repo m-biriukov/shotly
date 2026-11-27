@@ -16,6 +16,8 @@ pub enum Kind {
     Text,
     /// Rectangle whose contents are pixelated.
     Pixelate,
+    /// Translucent box over a line of text (multiply blend).
+    TextMark,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -77,7 +79,9 @@ pub enum Geom {
 impl Geom {
     fn for_kind(kind: Kind, start: Point) -> Self {
         match kind {
-            Kind::Rect | Kind::Ellipse | Kind::Pixelate => Self::Box { a: start, b: start },
+            Kind::Rect | Kind::Ellipse | Kind::Pixelate | Kind::TextMark => {
+                Self::Box { a: start, b: start }
+            }
             Kind::Line | Kind::Arrow => Self::Segment { a: start, b: start },
             Kind::Pen | Kind::Highlighter => Self::Stroke(Stroke::new(start)),
             Kind::Text => Self::Anchor(start),
@@ -136,6 +140,16 @@ impl Shape {
             style,
             text: String::new(),
         }
+    }
+
+    /// A highlight over `r`, one line of recognized text.
+    pub fn text_mark(r: Rect, style: Style) -> Self {
+        let mut s = Self::new(Kind::TextMark, Point::new(r.x, r.y), style);
+        s.geom = Geom::Box {
+            a: Point::new(r.x, r.y),
+            b: Point::new(r.right(), r.bottom()),
+        };
+        s
     }
 
     /// The point the shape was started at (the top-left corner for text).

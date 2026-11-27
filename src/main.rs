@@ -5,6 +5,7 @@
 
 mod app;
 mod capture;
+mod clock;
 mod config;
 mod editor;
 mod geom;
@@ -13,6 +14,7 @@ mod keys;
 mod layers;
 mod login;
 mod macos;
+mod ocr;
 mod output;
 mod overlay;
 mod paint;
@@ -33,6 +35,17 @@ use winit::event_loop::EventLoop;
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 
 fn main() -> Result<()> {
+    // Everything Shotly writes (screenshots, videos, settings, the log) is
+    // for this user only, including a video that is still being recorded or
+    // that failed half way.
+    // SAFETY: `umask` only changes this process's file-creation mask.
+    unsafe { libc::umask(0o077) };
+    // Dev aid (only with `--features dev-hooks`): SHOTLY_TEST_OCR=1 captures
+    // the screens, times text recognition and exits. No windows, no shortcuts.
+    #[cfg(feature = "dev-hooks")]
+    if std::env::var_os("SHOTLY_TEST_OCR").is_some() {
+        return ocr::time_screens();
+    }
     let oneshot = std::env::args().skip(1).any(|a| a == "--capture");
     log_to_file_unless_terminal();
     migrate_from_screenshoot(oneshot);
@@ -132,7 +145,7 @@ fn log_to_file_unless_terminal() {
     let _ = writeln!(
         file,
         "--- {} Shotly {} started ---",
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        clock::Stamp::now().log_line(),
         env!("CARGO_PKG_VERSION")
     );
     // SAFETY: dup2 onto the standard descriptors; `file` stays open until
@@ -143,10 +156,7 @@ fn log_to_file_unless_terminal() {
     }
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        eprintln!(
-            "--- {} crash ---",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-        );
+        eprintln!("--- {} crash ---", clock::Stamp::now().log_line());
         default(info);
     }));
 }

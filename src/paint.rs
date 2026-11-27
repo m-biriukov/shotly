@@ -24,16 +24,91 @@ pub fn round_stroke(width: f32) -> Stroke {
     }
 }
 
+/// How marker ink mixes with what is under it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ink {
+    /// On a light background: multiply, so dark text stays dark.
+    Darken,
+    /// On a dark background, where multiplied ink would vanish: screen, so
+    /// light text stays light.
+    Lighten,
+}
+
+impl Ink {
+    /// The ink that shows on most of `area` of an opaque RGBA picture `w`×`h`.
+    pub fn over(rgba: &[u8], w: u32, h: u32, area: Rect) -> Self {
+        let a = area.intersect(&Rect::new(0, 0, w as i32, h as i32));
+        // A few thousand samples are plenty, however big the stroke.
+        let step = (((a.w * a.h) as f32 / 4000.0).sqrt() as usize).max(1);
+        let (mut dark, mut all) = (0u32, 0u32);
+        for y in (a.y..a.bottom()).step_by(step) {
+            for x in (a.x..a.right()).step_by(step) {
+                let i = (y as usize * w as usize + x as usize) * 4;
+                let [r, g, b] = [0, 1, 2].map(|c| u32::from(rgba[i + c]));
+                dark += u32::from(luma(r, g, b) < 128);
+                all += 1;
+            }
+        }
+        // The majority decides: text covers less than its background.
+        if dark * 2 > all {
+            Self::Lighten
+        } else {
+            Self::Darken
+        }
+    }
+
+    fn blend(self) -> BlendMode {
+        match self {
+            Self::Darken => BlendMode::Multiply,
+            Self::Lighten => BlendMode::Screen,
+        }
+    }
+}
+
+/// Where a marker shape puts its ink, to judge what is under it.
+pub fn ink_area(s: &Shape) -> Rect {
+    match s.kind {
+        // A straight stroke's points span no height of their own.
+        Kind::Highlighter => s.bbox().expand((s.style.size / 2.0).ceil() as i32),
+        _ => s.bbox(),
+    }
+}
+
+/// Draws `s` onto the screen picture in `pm`; marker ink suits what it finds.
 pub fn draw_shape(pm: &mut PixmapMut, s: &Shape, ts: Transform) {
+    let ink = if matches!(s.kind, Kind::Highlighter | Kind::TextMark) {
+        let a = ink_area(s);
+        let area = Rect::new(
+            (a.x as f32 * ts.sx + ts.tx).round() as i32,
+            (a.y as f32 * ts.sy + ts.ty).round() as i32,
+            (a.w as f32 * ts.sx).round() as i32,
+            (a.h as f32 * ts.sy).round() as i32,
+        );
+        let (w, h) = (pm.width(), pm.height());
+        Ink::over(pm.data_mut(), w, h, area)
+    } else {
+        Ink::Darken
+    };
+    draw_inked(pm, s, ts, ink);
+}
+
+/// Draws `s` with marker ink chosen by the caller (`pm` may be empty, with the
+/// screen composited under it later).
+pub fn draw_inked(pm: &mut PixmapMut, s: &Shape, ts: Transform, ink: Ink) {
     let paint = paint(s.style.color, 255);
     let w = s.style.size;
     match (&s.geom, s.kind) {
         (Geom::Box { .. }, Kind::Rect) => draw_rect(pm, s.bbox(), &paint, w, ts),
         (Geom::Box { .. }, Kind::Ellipse) => draw_ellipse(pm, s.bbox(), &paint, w, ts),
+        (Geom::Box { .. }, Kind::TextMark) => {
+            marker(pm, s.bbox(), s.style.color, 1.0, ink, ts);
+        }
         (Geom::Box { .. }, _) => pixelate(pm, s.bbox(), w, ts),
         (Geom::Segment { a, b }, Kind::Arrow) => draw_arrow(pm, *a, *b, &paint, w, ts),
         (Geom::Segment { a, b }, _) => draw_line(pm, *a, *b, &paint, w, ts),
-        (Geom::Stroke(st), Kind::Highlighter) => draw_highlighter(pm, st.points(), paint, w, ts),
+        (Geom::Stroke(st), Kind::Highlighter) => {
+            draw_highlighter(pm, st.points(), paint, w, ink, ts);
+        }
         (Geom::Stroke(st), _) => draw_pen(pm, st.points(), &paint, w, ts),
         (Geom::Anchor(_), _) => draw_text(pm, s, ts),
     }
@@ -91,9 +166,23 @@ fn draw_pen(pm: &mut PixmapMut, pts: &[Point], paint: &Paint, w: f32, ts: Transf
     }
 }
 
-fn draw_highlighter(pm: &mut PixmapMut, pts: &[Point], mut paint: Paint, w: f32, ts: Transform) {
-    // Multiply keeps dark text under the marker readable.
-    paint.blend_mode = BlendMode::Multiply;
+/// Opacity of screened highlighter ink: strong enough to see on black, weak
+/// enough that white text still stands out from it.
+const LIGHTEN_ALPHA: f32 = 0.55;
+
+fn draw_highlighter(
+    pm: &mut PixmapMut,
+    pts: &[Point],
+    mut paint: Paint,
+    w: f32,
+    ink: Ink,
+    ts: Transform,
+) {
+    // Either way the text under the marker stays readable.
+    paint.blend_mode = ink.blend();
+    if ink == Ink::Lighten {
+        paint.shader.apply_opacity(LIGHTEN_ALPHA);
+    }
     let path = match pts {
         // A dot: a zero-length path strokes to nothing, so nudge it.
         [only] => {
@@ -108,6 +197,144 @@ fn draw_highlighter(pm: &mut PixmapMut, pts: &[Point], mut paint: Paint, w: f32,
             ..round_stroke(w)
         };
         pm.stroke_path(&path, &paint, &stroke, ts, None);
+    }
+}
+
+/// How far a marker stroke over a line `h` tall may reach past its box.
+pub fn marker_margin(h: i32) -> i32 {
+    (h as f32 * (MARKER_OVERSHOOT + MARKER_WOBBLE)).ceil() as i32 + 2
+}
+
+/// A marker's ends run past the text, and its edges are not quite straight:
+/// both as fractions of the line height.
+const MARKER_OVERSHOOT: f32 = 0.24;
+const MARKER_WOBBLE: f32 = 0.045;
+
+/// Repeatable noise in -1..1, so a stroke looks the same every time it is
+/// painted (on screen, while dragged, and in the saved file).
+fn noise(seed: u32, i: u32) -> f32 {
+    let mut x = seed.wrapping_mul(0x9E37_79B1) ^ i.wrapping_mul(0x85EB_CA6B);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x2C1B_3C6D);
+    x ^= x >> 13;
+    (x % 2001) as f32 / 1000.0 - 1.0
+}
+
+/// A highlighter-pen stroke over `r` in colour `rgb`: translucent, with
+/// slightly uneven edges and ends, ink pooled where the pen touched down, and
+/// faint streaks along it. `strength` (0..1) fades it for previews. `how` it
+/// blends keeps the text underneath readable.
+pub fn marker(pm: &mut PixmapMut, r: Rect, rgb: u32, strength: f32, how: Ink, ts: Transform) {
+    if r.w <= 0 || r.h <= 0 {
+        return;
+    }
+    // Seeded by the size only: moving a stroke must not change its texture.
+    let seed = (r.w as u32).wrapping_mul(31) ^ r.h as u32;
+    let (x, y, w, h) = (r.x as f32, r.y as f32, r.w as f32, r.h as f32);
+    let (over, wobble) = (h * MARKER_OVERSHOOT, h * MARKER_WOBBLE);
+    // Screened ink shows at full colour on black, so it goes on thinner.
+    let strength = match how {
+        Ink::Darken => strength,
+        Ink::Lighten => strength * 0.9,
+    };
+    let ink = |alpha: f32| {
+        let mut p = paint(rgb, (alpha * strength).clamp(0.0, 255.0) as u8);
+        p.blend_mode = how.blend();
+        p
+    };
+
+    // Long, gently waving edges; blunt, slightly slanted ends.
+    let steps = ((w / (h * 2.5).max(12.0)).ceil() as u32).clamp(2, 80);
+    let edge = |base: f32, row: u32| -> Vec<(f32, f32)> {
+        (0..=steps)
+            .map(|i| {
+                let at = x + w * i as f32 / steps as f32;
+                (at, base + noise(seed, row + i) * wobble)
+            })
+            .collect()
+    };
+    let top = edge(y, 10);
+    let mut bottom = edge(y + h, 500);
+    bottom.reverse();
+    let left = x - over * (0.75 + 0.25 * noise(seed, 1).abs());
+    let right = x + w + over * (0.75 + 0.25 * noise(seed, 2).abs());
+
+    let mut pb = PathBuilder::new();
+    pb.move_to(left + over * 0.15, top[0].1 + h * 0.04);
+    smooth_through(&mut pb, &top);
+    // The end: nearly straight, bulging a little.
+    pb.quad_to(right, y - wobble * 0.5, right - over * 0.1, y + h * 0.16);
+    pb.quad_to(
+        right + over * 0.12,
+        y + h * 0.55,
+        right - over * 0.25,
+        y + h * 0.9,
+    );
+    pb.quad_to(right - over * 0.4, y + h + wobble, bottom[0].0, bottom[0].1);
+    smooth_through(&mut pb, &bottom);
+    // The start.
+    pb.quad_to(
+        left + over * 0.1,
+        y + h + wobble * 0.6,
+        left + over * 0.05,
+        y + h * 0.8,
+    );
+    pb.quad_to(
+        left - over * 0.08,
+        y + h * 0.4,
+        left + over * 0.15,
+        top[0].1 + h * 0.04,
+    );
+    pb.close();
+    let Some(body) = pb.finish() else {
+        return;
+    };
+    pm.fill_path(&body, &ink(165.0), FillRule::Winding, ts, None);
+    // Ink gathers along the edge.
+    pm.stroke_path(
+        &body,
+        &ink(45.0),
+        &round_stroke((h * 0.04).max(1.0)),
+        ts,
+        None,
+    );
+
+    // Streaks left by the felt tip.
+    for (n, at) in [0.18_f32, 0.46, 0.64, 0.84].into_iter().enumerate() {
+        let n = n as u32;
+        let from = x - over * 0.3 + (noise(seed, 20 + n) + 1.0) * w * 0.08;
+        let to = x + w + over * 0.3 - (noise(seed, 30 + n) + 1.0) * w * 0.1;
+        let mid = y + h * (at + noise(seed, 40 + n) * 0.05);
+        let streak = [
+            (from, mid),
+            ((from + to) / 2.0, mid + noise(seed, 50 + n) * wobble),
+            (to, mid),
+        ];
+        if let Some(path) = polyline(&streak, false) {
+            let width = h * (0.07 + 0.05 * (noise(seed, 60 + n) + 1.0));
+            pm.stroke_path(&path, &ink(34.0), &round_stroke(width), ts, None);
+        }
+    }
+    // Where the pen touched down, a little darker.
+    let mut blot = PathBuilder::new();
+    blot.move_to(left + over * 0.2, y + h * 0.08);
+    blot.quad_to(x + h * 0.45, y + h * 0.2, x + h * 0.2, y + h * 0.55);
+    blot.quad_to(x + h * 0.05, y + h * 0.95, left + over * 0.15, y + h * 0.86);
+    blot.quad_to(left, y + h * 0.45, left + over * 0.2, y + h * 0.08);
+    blot.close();
+    if let Some(path) = blot.finish() {
+        pm.fill_path(&path, &ink(34.0), FillRule::Winding, ts, None);
+    }
+}
+
+/// Continues `pb` along `pts` with curves that pass near each point.
+fn smooth_through(pb: &mut PathBuilder, pts: &[(f32, f32)]) {
+    for w in pts.windows(2) {
+        let mid = ((w[0].0 + w[1].0) / 2.0, (w[0].1 + w[1].1) / 2.0);
+        pb.quad_to(w[0].0, w[0].1, mid.0, mid.1);
+    }
+    if let Some(&(x, y)) = pts.last() {
+        pb.line_to(x, y);
     }
 }
 
@@ -142,8 +369,16 @@ fn smooth_path(pts: &[Point]) -> Option<tiny_skia::Path> {
 /// Black or white, whichever reads better on `bg`.
 pub fn contrast(bg: u32) -> u32 {
     let (r, g, b) = ((bg >> 16) & 0xFF, (bg >> 8) & 0xFF, bg & 0xFF);
-    let luma = (299 * r + 587 * g + 114 * b) / 1000;
-    if luma > 150 { 0x000000 } else { 0xFFFFFF }
+    if luma(r, g, b) > 150 {
+        0x000000
+    } else {
+        0xFFFFFF
+    }
+}
+
+/// Perceived brightness (0..255) of a colour.
+fn luma(r: u32, g: u32, b: u32) -> u32 {
+    (299 * r + 587 * g + 114 * b) / 1000
 }
 
 fn draw_text(pm: &mut PixmapMut, s: &Shape, ts: Transform) {
@@ -189,6 +424,8 @@ pub fn rounded_rect(r: tiny_skia::Rect, rad: f32) -> tiny_skia::Path {
 
 /// Replaces every `block`-sized cell of `r` with its average colour.
 /// `ts` must be a scale + translate (no rotation), as used everywhere here.
+/// Works one band of cells at a time, reading and writing rows in order:
+/// this runs on every mouse move while a blur box is dragged.
 fn pixelate(pm: &mut PixmapMut, r: Rect, block: f32, ts: Transform) {
     let (pw, ph) = (pm.width() as i32, pm.height() as i32);
     let x0 = (r.x as f32 * ts.sx + ts.tx).round() as i32;
@@ -196,41 +433,182 @@ fn pixelate(pm: &mut PixmapMut, r: Rect, block: f32, ts: Transform) {
     let x1 = (r.right() as f32 * ts.sx + ts.tx).round() as i32;
     let y1 = (r.bottom() as f32 * ts.sy + ts.ty).round() as i32;
     let bs = ((block * ts.sx).round() as i32).max(2);
+    // Cells lie on a grid starting at the box's corner, clipped to the picture.
+    let clip = |from: i32, to: i32, size: i32| -> Vec<(usize, usize)> {
+        (from..to)
+            .step_by(bs as usize)
+            .filter_map(|a| {
+                let (lo, hi) = (a.max(0), (a + bs).min(to).min(size));
+                (lo < hi).then_some((lo as usize, hi as usize))
+            })
+            .collect()
+    };
+    let (cols, rows) = (clip(x0, x1, pw), clip(y0, y1, ph));
+    let stride = pw as usize * 4;
     let data = pm.data_mut();
-    let mut by = y0;
-    while by < y1 {
-        let mut bx = x0;
-        while bx < x1 {
-            let cell = Rect::new(bx, by, bs.min(x1 - bx), bs.min(y1 - by))
-                .intersect(&Rect::new(0, 0, pw, ph));
-            if !cell.is_empty() {
-                let mut sum = [0u32; 4];
-                for y in cell.y..cell.bottom() {
-                    for x in cell.x..cell.right() {
-                        let i = ((y * pw + x) * 4) as usize;
-                        for c in 0..4 {
-                            sum[c] += data[i + c] as u32;
-                        }
-                    }
-                }
-                let n = (cell.w * cell.h) as u32;
-                let avg = sum.map(|v| (v / n) as u8);
-                for y in cell.y..cell.bottom() {
-                    let i = ((y * pw + cell.x) * 4) as usize;
-                    for px in data[i..i + cell.w as usize * 4].as_chunks_mut::<4>().0 {
-                        px.copy_from_slice(&avg);
-                    }
-                }
+    let mut sums = vec![[0u32; 4]; cols.len()];
+    let mut avgs = vec![[0u8; 4]; cols.len()];
+    for &(top, bottom) in &rows {
+        sums.fill([0; 4]);
+        for y in top..bottom {
+            let line = &data[y * stride..(y + 1) * stride];
+            for (sum, &(a, b)) in sums.iter_mut().zip(&cols) {
+                add_pixels(sum, &line[a * 4..b * 4]);
             }
-            bx += bs;
         }
-        by += bs;
+        for ((avg, sum), &(a, b)) in avgs.iter_mut().zip(&sums).zip(&cols) {
+            let n = ((bottom - top) * (b - a)) as u32;
+            *avg = sum.map(|v| (v / n) as u8);
+        }
+        for y in top..bottom {
+            let line = &mut data[y * stride..(y + 1) * stride];
+            for (avg, &(a, b)) in avgs.iter().zip(&cols) {
+                line[a * 4..b * 4].as_chunks_mut::<4>().0.fill(*avg);
+            }
+        }
+    }
+}
+
+/// Adds the channels of the RGBA pixels in `bytes` to `sum`. Four pixels
+/// at a time, which the compiler turns into vector instructions.
+fn add_pixels(sum: &mut [u32; 4], bytes: &[u8]) {
+    let (quads, rest) = bytes.as_chunks::<16>();
+    let mut lanes = [0u32; 16];
+    for q in quads {
+        for (lane, &b) in lanes.iter_mut().zip(q) {
+            *lane += u32::from(b);
+        }
+    }
+    for (i, lane) in lanes.into_iter().enumerate() {
+        sum[i % 4] += lane;
+    }
+    for px in rest.as_chunks::<4>().0 {
+        for (s, &b) in sum.iter_mut().zip(px) {
+            *s += u32::from(b);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_marker_stroke_covers_its_line_stays_in_its_margin_and_repeats() {
+        let r = Rect::new(40, 30, 200, 30);
+        let draw = |r: Rect| {
+            let mut pm = tiny_skia::Pixmap::new(300, 100).unwrap();
+            pm.fill(tiny_skia::Color::WHITE);
+            let ts = Transform::identity();
+            marker(&mut pm.as_mut(), r, 0xFFCC00, 1.0, Ink::Darken, ts);
+            pm
+        };
+        let pm = draw(r);
+        assert_eq!(pm.data(), draw(r).data(), "same stroke every time");
+        // The line is tinted yellow, not covered over.
+        let mid = pm.pixel(140, 45).unwrap();
+        assert!(mid.red() > 230 && mid.blue() < 180, "{mid:?}");
+        // The ends run past the box, but never past the margin.
+        assert!(pm.pixel(38, 48).unwrap().blue() < 250);
+        let m = marker_margin(r.h);
+        let outer = r.expand(m);
+        for (i, p) in pm.pixels().iter().enumerate() {
+            let at = Point::new((i % 300) as i32, (i / 300) as i32);
+            if !outer.contains(at) {
+                assert_eq!(p.blue(), 255, "paint outside the margin at {at:?}");
+            }
+        }
+        // Black text under it stays black.
+        let mut text = tiny_skia::Pixmap::new(300, 100).unwrap();
+        text.fill(tiny_skia::Color::BLACK);
+        let ts = Transform::identity();
+        marker(&mut text.as_mut(), r, 0xFFCC00, 1.0, Ink::Darken, ts);
+        assert_eq!(text.pixel(140, 45).unwrap().red(), 0);
+    }
+
+    #[test]
+    fn a_mark_on_a_dark_background_shows_and_keeps_light_text() {
+        let mut pm = tiny_skia::Pixmap::new(300, 100).unwrap();
+        pm.fill(tiny_skia::Color::from_rgba8(20, 20, 20, 255));
+        // A white "letter" inside the line.
+        for y in 40..50 {
+            for x in 100..110 {
+                let i = (y * 300 + x) * 4;
+                pm.data_mut()[i..i + 4].copy_from_slice(&[255; 4]);
+            }
+        }
+        let style = Style {
+            color: 0xFFCC00,
+            size: 1.0,
+            bg: false,
+        };
+        let mark = Shape::text_mark(Rect::new(40, 30, 200, 30), style);
+        draw_shape(&mut pm.as_mut(), &mark, Transform::identity());
+        let back = pm.pixel(200, 45).unwrap();
+        assert!(back.red() > 90 && back.green() > 70, "{back:?}");
+        assert!(back.red() < 190 && back.blue() < 40, "{back:?}");
+        let letter = pm.pixel(105, 45).unwrap();
+        assert!(letter.red() == 255 && letter.green() == 255, "{letter:?}");
+    }
+
+    #[test]
+    fn ink_follows_most_of_the_background() {
+        let mut data = [255u8, 255, 255, 255].repeat(100);
+        let all = Rect::new(0, 0, 10, 10);
+        assert_eq!(Ink::over(&data, 10, 10, all), Ink::Darken);
+        data[..60 * 4].fill(0);
+        assert_eq!(Ink::over(&data, 10, 10, all), Ink::Lighten);
+        // Only the asked-for area counts, clipped to the picture.
+        let light = Rect::new(0, 6, 30, 30);
+        assert_eq!(Ink::over(&data, 10, 10, light), Ink::Darken);
+        let outside = Rect::new(50, 50, 5, 5);
+        assert_eq!(Ink::over(&data, 10, 10, outside), Ink::Darken);
+    }
+
+    /// `SHOTLY_MARKER_OUT=/path.png cargo test dump_marker -- --ignored`
+    /// writes sample strokes to look at.
+    #[test]
+    #[ignore = "writes a preview file"]
+    fn dump_marker() {
+        let Some(path) = std::env::var_os("SHOTLY_MARKER_OUT") else {
+            return;
+        };
+        let mut pm = tiny_skia::Pixmap::new(1800, 400).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        let dark = tiny_skia::Rect::from_xywh(900.0, 0.0, 900.0, 400.0).unwrap();
+        pm.fill_rect(dark, &paint(0x000000, 255), Transform::identity(), None);
+        for (i, (h, color)) in [
+            (30, 0xFFCC00),
+            (56, 0xFFCC00),
+            (44, 0x34C759),
+            (36, 0xFF3B30),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let y = 30 + 92 * i as i32;
+            let size = h as f32 * 0.8;
+            let l = crate::text::layout("Highlight the words in this line", size);
+            for (x, text) in [(60, 0x111111), (960, 0xEEEEEE)] {
+                l.draw(
+                    &mut pm.as_mut(),
+                    x as f32,
+                    y as f32 + h as f32 * 0.05,
+                    size,
+                    &paint(text, 255),
+                    Transform::identity(),
+                );
+                let style = Style {
+                    color,
+                    size: 1.0,
+                    bg: false,
+                };
+                let mark = Shape::text_mark(Rect::new(x, y, l.w as i32, h), style);
+                draw_shape(&mut pm.as_mut(), &mark, Transform::identity());
+            }
+        }
+        pm.save_png(path).unwrap();
+    }
     use crate::shape::Style;
     use tiny_skia::Pixmap;
 
@@ -316,6 +694,47 @@ mod tests {
         draw_shape(&mut pm.as_mut(), &s, Transform::identity());
         assert_eq!(pm.pixel(1, 1).unwrap().red(), 127);
         assert_eq!(pm.pixel(10, 10).unwrap().red(), 255);
+    }
+
+    #[test]
+    fn pixelate_matches_a_plain_average_per_cell_even_when_clipped() {
+        let (w, h) = (37, 29);
+        let mut pm = Pixmap::new(w, h).unwrap();
+        for (i, b) in pm.data_mut().iter_mut().enumerate() {
+            *b = (i * 7919 % 251) as u8;
+        }
+        let before = pm.data().to_vec();
+        // Starts off the picture and runs past its right edge.
+        let r = Rect::new(-3, 4, 50, 20);
+        let (bs, ts) = (6, Transform::identity());
+        pixelate(&mut pm.as_mut(), r, bs as f32, ts);
+        let at = |x: i32, y: i32| ((y * w as i32 + x) * 4) as usize;
+        for cy in (r.y..r.bottom()).step_by(bs) {
+            for cx in (r.x..r.right()).step_by(bs) {
+                let xs = cx.max(0)..(cx + bs as i32).min(w as i32);
+                let ys = cy.max(0)..(cy + bs as i32).min(r.bottom()).min(h as i32);
+                let pixels: Vec<(i32, i32)> = ys
+                    .clone()
+                    .flat_map(|y| xs.clone().map(move |x| (x, y)))
+                    .collect();
+                if pixels.is_empty() {
+                    continue;
+                }
+                for c in 0..4 {
+                    let sum: u32 = pixels
+                        .iter()
+                        .map(|&(x, y)| u32::from(before[at(x, y) + c]))
+                        .sum();
+                    let avg = (sum / pixels.len() as u32) as u8;
+                    for &(x, y) in &pixels {
+                        assert_eq!(pm.data()[at(x, y) + c], avg, "cell at {cx},{cy}");
+                    }
+                }
+            }
+        }
+        // Rows outside the box are untouched.
+        assert_eq!(pm.data()[..at(0, 4)], before[..at(0, 4)]);
+        assert_eq!(pm.data()[at(0, 24)..], before[at(0, 24)..]);
     }
 
     #[test]

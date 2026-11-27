@@ -231,6 +231,12 @@ impl App {
 
     fn finish(&mut self, el: &ActiveEventLoop, done: Option<Finished>, error: Option<String>) {
         self.session = None;
+        // First: the choices decide, among other things, whether to count down.
+        if !self.oneshot
+            && let Some(done) = &done
+        {
+            self.remember_choices(done);
+        }
         let picked = matches!(done.as_ref().map(|d| &d.outcome), Some(Outcome::Record(_)));
         let cmds = self
             .flow
@@ -263,7 +269,6 @@ impl App {
             );
             return;
         };
-        self.remember_choices(&done);
         if let Outcome::Record(target) = &done.outcome {
             let target = *target;
             return self.begin_recording(el, target, &cmds);
@@ -273,6 +278,9 @@ impl App {
             Outcome::Cancelled | Outcome::Record(_) => {}
             Outcome::Copied => {
                 self.notify(el, display, Notice::new("Copied to clipboard", TOAST_SHORT));
+            }
+            Outcome::CopiedText(words) => {
+                self.notify(el, display, Notice::new(copied_words(words), TOAST_SHORT));
             }
             Outcome::Saved(p) => {
                 let notice = saved_notice("Saved — click to show in Finder", p);
@@ -289,7 +297,7 @@ impl App {
         }
     }
 
-    /// Remembers the last colour, size and preset for next time.
+    /// Remembers the last colour, size, preset and recording settings.
     fn remember_choices(&mut self, done: &Finished) {
         if !choices_changed(&self.cfg, done) {
             return;
@@ -297,6 +305,9 @@ impl App {
         self.cfg.color = done.color;
         self.cfg.set_width(done.width);
         self.cfg.preset = done.preset;
+        if let Some(options) = done.record {
+            self.cfg.set_record_options(options);
+        }
         if let Err(e) = self.cfg.save() {
             eprintln!("could not save config: {e:#}");
         }
@@ -519,12 +530,18 @@ impl ApplicationHandler<AppEvent> for App {
     }
 }
 
-/// Whether the colour, size or preset the session ended with differs from
-/// what the config remembers.
+/// Whether what the session ended with differs from what the config
+/// remembers.
 fn choices_changed(cfg: &Config, done: &Finished) -> bool {
     done.color != cfg.color
         || config::parse_width(&cfg.width) != Some(done.width)
         || done.preset != cfg.preset
+        || done.record.is_some_and(|r| r != cfg.record_options())
+}
+
+fn copied_words(n: usize) -> String {
+    let words = if n == 1 { "word" } else { "words" };
+    format!("Copied {n} {words}")
 }
 
 /// "Saved": the file's name, and a click shows it in Finder.
@@ -550,12 +567,19 @@ mod tests {
             color,
             width,
             preset,
+            record: None,
             display: (0, 0, 100, 100),
         }
     }
 
     #[test]
-    fn only_a_changed_colour_size_or_preset_is_saved() {
+    fn the_copied_text_notice_counts_words() {
+        assert_eq!(copied_words(1), "Copied 1 word");
+        assert_eq!(copied_words(12), "Copied 12 words");
+    }
+
+    #[test]
+    fn only_a_changed_choice_is_saved() {
         let cfg = Config::default();
         let same = finished(cfg.color, cfg.width(), cfg.preset);
         assert!(!choices_changed(&cfg, &same));
@@ -568,5 +592,14 @@ mod tests {
             &cfg,
             &finished(cfg.color, cfg.width(), Preset::Full)
         ));
+        // The recording panel: untouched, then changed.
+        let mut record = finished(cfg.color, cfg.width(), cfg.preset);
+        record.record = Some(cfg.record_options());
+        assert!(!choices_changed(&cfg, &record));
+        record.record = Some(crate::config::RecordOptions {
+            mic: !cfg.record_mic,
+            ..cfg.record_options()
+        });
+        assert!(choices_changed(&cfg, &record));
     }
 }

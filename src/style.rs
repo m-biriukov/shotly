@@ -13,13 +13,18 @@ pub enum Tool {
     Highlighter,
     Text,
     Blur,
+    /// Select recognized text in the picture, to copy it.
+    TextSelect,
+    /// Highlight recognized text: boxes snap to its words and lines.
+    TextMark,
 }
 
 impl Tool {
     /// Shape this tool draws; `None` for the select tool.
     pub fn kind(self) -> Option<Kind> {
         match self {
-            Self::Select => None,
+            // The text tools make their shapes from recognized words.
+            Self::Select | Self::TextSelect | Self::TextMark => None,
             Self::Rect => Some(Kind::Rect),
             Self::Ellipse => Some(Kind::Ellipse),
             Self::Line => Some(Kind::Line),
@@ -42,7 +47,14 @@ impl Tool {
             Self::Highlighter => "Highlighter",
             Self::Text => "Text",
             Self::Blur => "Blur (pixelate)",
+            Self::TextSelect => "Select text",
+            Self::TextMark => "Highlight text",
         }
+    }
+
+    /// Works on the words recognized in the picture.
+    pub fn uses_text(self) -> bool {
+        matches!(self, Self::TextSelect | Self::TextMark)
     }
 
     /// The keyboard shortcut that picks this tool.
@@ -57,6 +69,8 @@ impl Tool {
             Self::Highlighter => 'H',
             Self::Text => 'T',
             Self::Blur => 'B',
+            Self::TextSelect => 'S',
+            Self::TextMark => 'M',
         }
     }
 
@@ -72,6 +86,8 @@ impl Tool {
             'h' => Self::Highlighter,
             't' => Self::Text,
             'b' => Self::Blur,
+            's' => Self::TextSelect,
+            'm' => Self::TextMark,
             _ => return None,
         })
     }
@@ -97,6 +113,8 @@ impl Width {
             // Blocks smaller than ~10 pt can leave text recoverable
             // (e.g. with Depix), so even "small" stays coarse.
             Kind::Pixelate => (10.0, 16.0, 24.0),
+            // Sized by the words it covers.
+            Kind::TextMark => (1.0, 1.0, 1.0),
         };
         match self {
             Self::S => s,
@@ -138,6 +156,8 @@ mod tests {
             Tool::Highlighter,
             Tool::Text,
             Tool::Blur,
+            Tool::TextSelect,
+            Tool::TextMark,
         ] {
             assert_eq!(Tool::from_key(t.key()), Some(t), "{t:?}");
         }

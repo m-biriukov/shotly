@@ -104,7 +104,7 @@ impl App {
         let display = macos::display_frame(target.display_id);
         let path = match record::unique_path(
             &self.cfg.save_dir(),
-            &self.cfg.video_name(chrono::Local::now()),
+            &self.cfg.video_name(crate::clock::Stamp::now()),
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -350,7 +350,10 @@ impl App {
             a.effects = None;
             a.outline = None;
             match a.rec.stop_and_wait(QUIT_WAIT) {
-                Ok(p) => println!("Saved {}", p.display()),
+                Ok(p) => {
+                    record::make_private(&p);
+                    println!("Saved {}", p.display());
+                }
                 Err(e) => eprintln!("recording not finished cleanly: {e}"),
             }
         }

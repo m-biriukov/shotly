@@ -4,24 +4,27 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use objc2_core_graphics::CGImage;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{CursorIcon, Window, WindowId};
+use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 
 use crate::capture::{self, Shot};
-use crate::config::{Config, Preset};
+use crate::config::{Config, Preset, RecordOptions};
 use crate::editor::{Action, Cursor, EditKey, Editor};
 use crate::geom::{Handle, Point, Rect, Scale};
 use crate::keys::latin_shortcut;
 use crate::layers::Layers;
+use crate::ocr::{self, Word};
 use crate::record::Target;
-use crate::render::Backdrop;
-use crate::style::{Tool, Width};
+use crate::render::{self, Backdrop};
+use crate::style::{PALETTE, Tool, Width};
 use crate::toolbar::Item;
 use crate::{macos, output, snap};
 
@@ -48,6 +51,8 @@ struct Win {
     /// Layers need syncing with the editor.
     dirty: bool,
     tip: Tip,
+    /// Text recognition in progress for this display.
+    reading: Option<Recognition>,
 }
 
 /// Tooltip timing for one window: it appears after the cursor rests on a
@@ -74,6 +79,18 @@ impl Tip {
     }
 }
 
+struct Recognition {
+    answer: mpsc::Receiver<Result<Vec<Word>, String>>,
+    since: Instant,
+    slow: bool,
+}
+
+/// After this long the label explains the wait.
+const OCR_SLOW: Duration = Duration::from_secs(3);
+
+/// How often to look for the recognizer's answer.
+const OCR_POLL: Duration = Duration::from_millis(50);
+
 /// How long the cursor rests on a button before its tooltip appears.
 const TIP_DELAY: Duration = Duration::from_millis(550);
 
@@ -88,6 +105,8 @@ pub enum Outcome {
     Cancelled,
     Copied,
     Saved(PathBuf),
+    /// Recognized text went to the clipboard; the number of words.
+    CopiedText(usize),
     /// The user picked an area to record (record mode).
     Record(Target),
     Failed(String),
@@ -100,6 +119,8 @@ pub struct Finished {
     pub width: Width,
     /// Preset in use when the session ended, to remember for next time.
     pub preset: Preset,
+    /// Recording settings as left in the panel (record mode only).
+    pub record: Option<RecordOptions>,
     /// Frame (global points) of the display the capture was on.
     pub display: macos::Frame,
 }
@@ -109,6 +130,8 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const DOUBLE_CLICK_PT: f64 = 4.0;
 
 pub struct Session {
+    /// The drawing crosshair in each palette colour.
+    inks: Vec<CustomCursor>,
     mode: Mode,
     /// Window frames on screen when the session started (global points).
     frames: Vec<snap::Frame>,
@@ -158,7 +181,7 @@ impl Session {
             editor.set_defaults(cfg.color, cfg.width());
             editor.set_snaps(snap::to_display(&frames, shot.origin_pt, scale, bounds));
             if mode == Mode::Record {
-                editor.set_record_mode();
+                editor.set_record_mode(cfg.record_options());
             }
             editor.set_preset(cfg.preset);
             wins.push(Win {
@@ -170,9 +193,11 @@ impl Session {
                 cursor: Point::new(0, 0),
                 dirty: true,
                 tip: Tip::new(),
+                reading: None,
             });
         }
         let mut session = Self {
+            inks: ink_cursors(el)?,
             mode,
             frames,
             cfg: cfg.clone(),
@@ -254,6 +279,7 @@ impl Session {
     /// of input events, so a burst of mouse moves costs one update.
     pub fn flush(&mut self) {
         let now = Instant::now();
+        self.read_text();
         for w in &mut self.wins {
             let item = w.editor.hover_target().map(|t| t.item);
             let was_shown = w.tip.shown;
@@ -276,24 +302,86 @@ impl Session {
             let needs_pixels = ed.active_shape().is_some() || ed.static_shapes().next().is_some();
             if needs_pixels && w.backdrop.is_none() {
                 let (bw, bh) = w.size();
-                w.backdrop = Some(Backdrop::new(self.shots[w.shot].image(), bw, bh));
+                w.backdrop = Some(Backdrop::new(self.shots[w.shot].shared_image(), bw, bh));
             }
             w.layers.sync(&w.editor, w.backdrop.as_ref(), w.tip.shown);
         }
     }
 
-    /// When a tooltip is due, so the event loop wakes up for it.
+    /// Starts text recognition where a text tool needs it, and hands over
+    /// the answers that have arrived.
+    fn read_text(&mut self) {
+        for w in &mut self.wins {
+            if w.editor.wants_words() {
+                w.reading = Some(Recognition {
+                    answer: ocr::start(&self.shots[w.shot].cg),
+                    since: Instant::now(),
+                    slow: false,
+                });
+                w.editor.words_pending();
+                w.dirty = true;
+            }
+            let Some(job) = &mut w.reading else { continue };
+            let answer = match job.answer.try_recv() {
+                Ok(answer) => answer,
+                Err(mpsc::TryRecvError::Empty) => {
+                    if !job.slow && job.since.elapsed() >= OCR_SLOW {
+                        job.slow = true;
+                        w.editor.words_slow();
+                        w.dirty = true;
+                    }
+                    continue;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Err("the text recognizer stopped".to_string())
+                }
+            };
+            let took = job.since.elapsed();
+            w.reading = None;
+            let image = &self.shots[w.shot].cg;
+            let from = (
+                CGImage::width(Some(image)) as u32,
+                CGImage::height(Some(image)) as u32,
+            );
+            let words = match answer {
+                Ok(words) => {
+                    println!("text recognition: {} words in {took:.1?}", words.len());
+                    Some(ocr::scaled(words, from, w.size()))
+                }
+                Err(e) => {
+                    eprintln!("text recognition failed: {e}");
+                    None
+                }
+            };
+            w.editor.set_words(words);
+            w.dirty = true;
+        }
+    }
+
+    /// When a tooltip is due or recognized text may be ready, so the event
+    /// loop wakes up for it.
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.wins
+        let tip = self
+            .wins
             .iter()
             .filter(|w| w.tip.waiting())
             .map(|w| w.tip.since + TIP_DELAY)
-            .min()
+            .min();
+        let text = self
+            .wins
+            .iter()
+            .any(|w| w.reading.is_some())
+            .then(|| Instant::now() + OCR_POLL);
+        [tip, text].into_iter().flatten().min()
     }
 
     fn update_cursor(&self, i: usize) {
         let win = &self.wins[i];
         let icon = match win.editor.cursor(win.cursor) {
+            Cursor::Ink(color) => match self.inks.get(color) {
+                Some(ink) => return win.window.set_cursor(ink.clone()),
+                None => CursorIcon::Crosshair,
+            },
             Cursor::Crosshair => CursorIcon::Crosshair,
             Cursor::Move => CursorIcon::Move,
             Cursor::Pointer => CursorIcon::Default,
@@ -319,6 +407,7 @@ impl Session {
             color: ed.color(),
             width: ed.width(),
             preset: ed.preset(),
+            record: ed.record_options(),
             display: (
                 shot.origin_pt.0,
                 shot.origin_pt.1,
@@ -333,6 +422,17 @@ impl Session {
             return Some(self.finished(i, Outcome::Cancelled));
         }
         let i = self.active()?;
+        if action == Action::CopyText {
+            let (text, words) = self.wins[i].editor.copyable_text()?;
+            for w in &self.wins {
+                w.window.set_visible(false);
+            }
+            let outcome = match output::copy_text(&text) {
+                Ok(()) => Outcome::CopiedText(words),
+                Err(e) => Outcome::Failed(format!("{e:#}")),
+            };
+            return Some(self.finished(i, outcome));
+        }
         if action == Action::Record {
             // Return before any area was picked does nothing.
             self.wins[i].editor.area()?;
@@ -359,7 +459,7 @@ impl Session {
                 Err(e) => Outcome::Failed(format!("{e:#}")),
             }
         } else {
-            let name = self.cfg.file_name(chrono::Local::now());
+            let name = self.cfg.file_name(crate::clock::Stamp::now());
             match output::save(&img, &self.cfg.save_dir(), &name, self.cfg.format) {
                 Ok(p) => Outcome::Saved(p),
                 Err(e) => Outcome::Failed(format!("{e:#}")),
@@ -420,6 +520,14 @@ impl Session {
         if self.preset_key(i, event) {
             return None;
         }
+        // Esc closes open choices before anything else.
+        if let Key::Named(NamedKey::Escape) = event.logical_key.as_ref()
+            && let Some(a) = self.active()
+            && self.wins[a].editor.close_flyout()
+        {
+            self.wins[a].dirty = true;
+            return None;
+        }
         if self.mode == Mode::Record {
             // Only Return (start) and Esc (cancel); no drawing tools here.
             return match event.logical_key.as_ref() {
@@ -437,15 +545,23 @@ impl Session {
             .active()
             .is_some_and(|a| self.wins[a].editor.is_editing());
 
+        // Esc lets go of a selected shape or words before it cancels.
         if let Key::Named(NamedKey::Escape) = key
+            && !editing
             && let Some(a) = self.active()
-            && self.wins[a].editor.close_flyout()
+            && self.wins[a].editor.deselect()
         {
             self.wins[a].dirty = true;
+            self.update_cursor(a);
             return None;
         }
+        let text_selected = self
+            .active()
+            .is_some_and(|a| self.wins[a].editor.copyable_text().is_some());
         let action = match key {
             Key::Named(NamedKey::Escape) if !editing => Some(Action::Cancel),
+            // ⌘C takes the selected text; Return still takes the picture.
+            _ if cmd && letter == Some('c') && text_selected => Some(Action::CopyText),
             Key::Named(NamedKey::Enter) if !editing => Some(Action::Copy),
             _ if cmd && letter == Some('c') => Some(Action::Copy),
             _ if cmd && letter == Some('s') => Some(Action::Save),
@@ -457,7 +573,9 @@ impl Session {
         let i = self.active()?;
         let ed = &mut self.wins[i].editor;
 
-        if cmd && letter == Some('z') {
+        if cmd && letter == Some('a') && !editing && ed.select_all_words() {
+            // Handled.
+        } else if cmd && letter == Some('z') {
             if shift { ed.redo() } else { ed.undo() }
         } else if editing {
             let edit_key = match key {
@@ -553,6 +671,7 @@ impl Session {
                         self.wins[i].tip.suppressed = true;
                         let double = self.is_double_click(i, p);
                         let before = self.wins[i].editor.preset();
+                        let options = self.wins[i].editor.record_options();
                         if let Some(action) = self.wins[i].editor.press(p, double) {
                             return self.act(i, action);
                         }
@@ -560,6 +679,14 @@ impl Session {
                         let after = self.wins[i].editor.preset();
                         if after != before {
                             self.choose_preset_others(i, after);
+                        }
+                        // So does a recording setting.
+                        if let Some(new) = self.wins[i].editor.record_options()
+                            && options != Some(new)
+                        {
+                            for w in &mut self.wins {
+                                w.editor.set_record_mode(new);
+                            }
                         }
                     }
                     ElementState::Released => self.wins[i].editor.release(p, shift),
@@ -574,6 +701,19 @@ impl Session {
         }
         None
     }
+}
+
+/// One crosshair cursor per palette colour.
+fn ink_cursors(el: &ActiveEventLoop) -> Result<Vec<CustomCursor>> {
+    let side = render::CROSSHAIR_SIDE;
+    PALETTE
+        .iter()
+        .map(|&rgb| {
+            let source =
+                CustomCursor::from_rgba(render::crosshair(rgb), side, side, side / 2, side / 2)?;
+            Ok(el.create_custom_cursor(source))
+        })
+        .collect()
 }
 
 /// The window whose frame is `picked` (within a point), if any.
